@@ -1,0 +1,47 @@
+# Standalone stack — its own network, independent of any other compose
+# project on the host. Meant to live in and be run from its own directory
+# (see deploy/README.md), so this project's lifecycle (build, restart,
+# teardown) never touches unrelated services on the same machine.
+
+services:
+  imou-cli:
+    image: imou-cli:latest
+    container_name: imou-cli
+    restart: unless-stopped
+    networks:
+      - imou-network
+    env_file:
+      - ./.env
+    volumes:
+      - ./data/clips:/app/clips
+      - ./data/logs:/app/logs
+      - ./data/ring_buffer:/app/ring_buffer
+    command:
+      - listen
+      - https://your-domain.example.com:8443/imou-callback # replace with your registered callback URL
+      - --listen-addr=0.0.0.0:8787
+      - --events-file=/app/logs/motion_events.jsonl
+      - --clips-dir=/app/clips
+      - --buffer-dir=/app/ring_buffer
+
+  imou-caddy:
+    image: caddy:2
+    container_name: imou-caddy
+    restart: unless-stopped
+    networks:
+      - imou-network
+    ports:
+      - "8443:8443"
+    depends_on:
+      - imou-cli
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Replace with your own domain's cert files. Mount the individual
+      # resolved files, not the letsencrypt/live/<domain>/ directory itself —
+      # its symlinks are relative and break across a bind mount.
+      - /etc/letsencrypt/live/your-domain.example.com/fullchain.pem:/certs/fullchain.pem:ro
+      - /etc/letsencrypt/live/your-domain.example.com/privkey.pem:/certs/privkey.pem:ro
+
+networks:
+  imou-network:
+    driver: bridge

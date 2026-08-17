@@ -1,0 +1,18 @@
+[package]
+name = "imou-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+chrono = "0.4.45"
+clap = { version = "4.6.6", features = ["derive"] }
+dotenvy = "0.15.7"
+md-5 = "0.11.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "process", "fs", "net"] }
+uuid = { version = "1.24.1", features = ["v4"] }

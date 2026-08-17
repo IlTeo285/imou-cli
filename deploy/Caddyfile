@@ -1,0 +1,14 @@
+{
+    admin off
+    auto_https off
+}
+
+:8443 {
+    tls /certs/fullchain.pem /certs/privkey.pem
+
+    log {
+        output file /var/log/caddy/access.log
+    }
+
+    reverse_proxy imou-cli:8787
+}
