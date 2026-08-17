@@ -159,8 +159,10 @@ async fn callback_handler(State(state): State<AppState>, body: Bytes) -> StatusC
     StatusCode::OK
 }
 
-/// Registers `callback_url` with Imou and serves the push endpoint until
-/// Ctrl+C, then best-effort unregisters it. Unlike `watch`, detection is
+/// Serves the push endpoint until Ctrl+C. Does **not** call
+/// `setMessageCallback` — the callback URL must already be registered
+/// manually via the Imou console (see the note printed at startup and
+/// `CLAUDE.md`'s push/webhook section for why). Unlike `watch`, detection is
 /// entirely push-driven — no polling loop.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -231,17 +233,12 @@ pub async fn run(
             .await
     });
 
-    if let Err(e) = api::push::set_callback(client, callback_url, "alarm", "on").await {
-        let _ = shutdown_tx.send(());
-        let _ = server.await;
-        recorder::shutdown_all(recording).await;
-        return Err(e);
-    }
-    println!("registered push callback: {callback_url}");
     println!(
-        "note: the first delivery after a fresh registration can take a long \
-         time to start (observed ~48 minutes live) even though the endpoint \
-         is reachable immediately — an Imou-side warm-up, not a bug here"
+        "not registering the push callback — this must already be set to \
+         {callback_url} manually via the Imou console (registering via \
+         setMessageCallback here was found to reset the account's \"IoT \
+         Device Message\" push subscription, which real motion events \
+         depend on)"
     );
     println!("press Ctrl+C to stop");
 
@@ -251,10 +248,6 @@ pub async fn run(
 
     println!("stopping...");
     recorder::shutdown_all(recording).await;
-
-    if let Err(e) = api::push::set_callback(client, callback_url, "alarm", "off").await {
-        eprintln!("warning: failed to unregister push callback: {e}");
-    }
 
     Ok(())
 }

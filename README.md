@@ -126,12 +126,14 @@ just get the JSONL log entry, same as before.
 
 ### `listen`
 
-Registers `callback_url` with Imou (`setMessageCallback`) and reacts to
-events as they're pushed — no polling. Same JSONL log format and local clip
-recording as `watch` (identical `--clips-dir`/`--pre-roll-secs`/
+Reacts to events as they're pushed — no polling. Same JSONL log format and
+local clip recording as `watch` (identical `--clips-dir`/`--pre-roll-secs`/
 `--post-roll-secs` flags). `callback_url` must be an HTTPS URL, already
 publicly reachable when `listen` starts, ending in `/imou-callback` (fixed
-path).
+path) — **`listen` does not call `setMessageCallback` itself**, register it
+manually via the Imou console before starting (an automatic call on every
+startup was found to reset the account's "IoT Device Message" push
+subscription, which real events depend on; see CLAUDE.md).
 
 Confirmed live that push does eventually deliver real events — but a fresh
 registration took **~48 minutes** to start delivering, far more than the

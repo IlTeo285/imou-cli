@@ -6,7 +6,7 @@ own network, independent of any other compose project on the same host —
 fronted by a dedicated Caddy container that terminates TLS with your own
 domain's certificate.
 
-`setMessageCallback`'s `callbackUrl` must be an HTTPS URL that's already
+`listen`'s `callbackUrl` argument must be an HTTPS URL that's already
 publicly reachable when `listen` starts (see the main README/CLAUDE.md for
 what's been observed about registration/delivery behavior). That means,
 before deploying:
@@ -16,6 +16,12 @@ before deploying:
   its own, so it doesn't need port 80).
 - Port forwarding on your router/firewall for whatever port you expose
   Caddy on (`8443` by default in `docker-compose.yaml`) to this host.
+- **The callback registered manually via the Imou console** (Console →
+  message push settings → `setMessageCallback`, pointed at that domain's
+  `/imou-callback`) — `listen` no longer calls `setMessageCallback` itself;
+  doing so automatically on every startup was found to reset the account's
+  "IoT Device Message" push subscription that real events depend on. See
+  CLAUDE.md's `listen` section.
 
 ## Steps
 
@@ -55,15 +61,18 @@ before deploying:
    ```sh
    docker exec imou-cli sh -c 'cat < /dev/null > /dev/tcp/<camera-ip>/554' && echo OK
    ```
-3. `docker logs imou-cli` — shows the push callback registered and, for
-   each channel with local RTSP config, a ring-buffer recorder starting.
+3. `docker logs imou-cli` — shows a reminder that the callback must already
+   be registered manually (not "registered", since this process no longer
+   does that) and, for each channel with local RTSP config, a ring-buffer
+   recorder starting.
 4. Generate real motion, then check:
    - `~/imou-cli/data/logs/motion_events.jsonl` for a new line.
    - `~/imou-cli/data/clips/<channel>/...mp4` for the clip.
-   Don't be alarmed if the very first event after a fresh registration
-   takes several minutes — Imou's push delivery has a slow warm-up after
-   `setMessageCallback` is called (observed ~48 minutes once, live — see
-   CLAUDE.md).
-5. `docker compose restart imou-cli` — confirm the callback re-registers
-   cleanly and `data/` contents survive the restart (bind mounts, not
-   anonymous volumes, so they should).
+   Don't be alarmed if the very first event after a fresh manual
+   registration takes several minutes — Imou's push delivery has a slow
+   warm-up after `setMessageCallback` is called (observed ~48 minutes once,
+   live — see CLAUDE.md).
+5. `docker compose restart imou-cli` — confirm `data/` contents survive the
+   restart (bind mounts, not anonymous volumes, so they should); the
+   callback registration itself is untouched by this, since `listen` never
+   calls `setMessageCallback`.

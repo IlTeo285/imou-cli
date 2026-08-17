@@ -218,11 +218,20 @@ extraction (`recorder::spawn_clip_extraction`). Keep it that way — if the
 two modes' handling of an `Alarm` ever needs to diverge, that's a sign the
 shared code needs a parameter, not a fork.
 
-**`listen` (push-based, `listen.rs`)**: registers a callback via
-`api::push::set_callback` (`callbackFlag: "alarm"`, `basePush: "1"` — see
-the doc-uncertainty note on that function) and serves `POST /imou-callback`
-with axum, always returning 200 (Imou disables the callback after repeated
-non-200s). `PushEvent`/`PushContent` model the **real** payload shape (see
+**`listen` (push-based, `listen.rs`)**: serves `POST /imou-callback` with
+axum, always returning 200 (Imou disables the callback after repeated
+non-200s). **Does not call `setMessageCallback`** — that used to be done
+automatically on every startup (`api::push::set_callback`, now deleted) but
+was found to reset the account's "IoT Device Message" push subscription
+(the one real motion events, `msgType: "iotEvent"`, actually depend on) —
+`setMessageCallback`'s documented `callbackFlag` values (`alarm`,
+`deviceStatus`, `numberstat`, `faceAnalysis`) don't even include an
+IoT-specific flag, so that subscription lives outside this API entirely,
+most likely as a toggle in the Imou Open Platform console itself. The
+callback URL must now be registered **manually via the Imou console** —
+`listen` just assumes it's already pointed at `--callback-url` and prints a
+reminder of that at startup. `PushEvent`/`PushContent` model the **real**
+payload shape (see
 the push/webhook note above) — every field `Option`, because Imou also
 sends empty `{}` verification pings that must be silently accepted, not
 treated as errors. A `PushEvent` is converted into a synthetic `Alarm` via
