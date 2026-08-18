@@ -12,6 +12,7 @@ use crate::error::Result;
 use crate::event_log::EventLog;
 use crate::gdrive;
 use crate::motion_event::MotionEvent;
+use crate::mqtt;
 use crate::recorder;
 
 /// Extra safety margin added on top of `pre_roll + interval` when computing
@@ -145,6 +146,17 @@ pub async fn run(
         ),
     }
 
+    let mqtt_client = mqtt::config_from_env().map(|cfg| Arc::new(mqtt::MqttPublisher::connect(cfg)));
+    match &mqtt_client {
+        Some(m) => println!(
+            "publishing motion events to MQTT broker {}:{} (topic prefix \"{}\")",
+            m.host, m.port, m.topic_prefix
+        ),
+        None => println!(
+            "MQTT publish not configured (MQTT_BROKER_HOST/MQTT_BROKER_PORT not set) — motion events are not published"
+        ),
+    }
+
     println!(
         "watching {} channel(s) across {} device(s), polling every {}s, writing motion events to {}",
         channels.len(),
@@ -177,6 +189,10 @@ pub async fn run(
                                 "motion detected: device={device_id} channel={channel_id} ({channel_name})"
                             ),
                             Err(e) => eprintln!("failed to write motion event: {e}"),
+                        }
+
+                        if let Some(mqtt) = &mqtt_client {
+                            mqtt.publish(&event, channel_name);
                         }
 
                         if recording.recorded_channels.contains(channel_name) {

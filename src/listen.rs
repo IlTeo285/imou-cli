@@ -18,6 +18,7 @@ use crate::error::Result;
 use crate::event_log::EventLog;
 use crate::gdrive;
 use crate::motion_event::MotionEvent;
+use crate::mqtt;
 use crate::recorder;
 
 const CALLBACK_PATH: &str = "/imou-callback";
@@ -81,6 +82,7 @@ struct AppState {
     pre_roll: Duration,
     post_roll: Duration,
     gdrive: Option<Arc<gdrive::GDriveClient>>,
+    mqtt: Option<Arc<mqtt::MqttPublisher>>,
 }
 
 /// Handles one push delivery. Always returns 200 — per push.html, Imou
@@ -145,6 +147,10 @@ async fn callback_handler(State(state): State<AppState>, body: Bytes) -> StatusC
     match state.event_log.append(&event) {
         Ok(()) => println!("motion detected (push): device={did} ({channel_name})"),
         Err(e) => eprintln!("failed to write motion event: {e}"),
+    }
+
+    if let Some(mqtt) = &state.mqtt {
+        mqtt.publish(&event, &channel_name);
     }
 
     if state.recorded_channels.contains(&channel_name) {
@@ -216,6 +222,17 @@ pub async fn run(
         ),
     }
 
+    let mqtt_client = mqtt::config_from_env().map(|cfg| Arc::new(mqtt::MqttPublisher::connect(cfg)));
+    match &mqtt_client {
+        Some(m) => println!(
+            "publishing motion events to MQTT broker {}:{} (topic prefix \"{}\")",
+            m.host, m.port, m.topic_prefix
+        ),
+        None => println!(
+            "MQTT publish not configured (MQTT_BROKER_HOST/MQTT_BROKER_PORT not set) — motion events are not published"
+        ),
+    }
+
     let state = AppState {
         app_id: Arc::from(client.app_id()),
         event_log,
@@ -226,6 +243,7 @@ pub async fn run(
         pre_roll,
         post_roll,
         gdrive: gdrive_client,
+        mqtt: mqtt_client,
     };
 
     let app = Router::new()

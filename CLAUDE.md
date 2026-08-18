@@ -349,6 +349,64 @@ Verified live: day-folder creation, reuse of an existing day folder on a
 second upload the same day, and the retention sweep actually deleting an
 old (synthetically dated) folder.
 
+## MQTT motion event publishing (`src/mqtt.rs`)
+
+Both `watch` and `listen` optionally publish each `MotionEvent` — the exact
+same JSON already written to `motion_events.jsonl`, no second schema — to an
+MQTT broker, entirely opt-in: `mqtt::config_from_env()` returns `None`
+unless `MQTT_BROKER_HOST`/`MQTT_BROKER_PORT` are both set, and `watch::run`/
+`listen::run` each independently build their own `Option<Arc<MqttPublisher>>`
+from it (same convention as `gdrive::config_from_env()` — behavior is
+unchanged when unconfigured, no CLI flag gates it).
+
+**Topic shape**: one topic per camera, `{MQTT_TOPIC_PREFIX}/<channel_name>/motion`
+(default prefix `imou`), meant to be consumed via a wildcard subscription
+like `imou/+/motion`. `channel_name` (from Imou's own per-camera naming,
+already trusted as-is elsewhere, e.g. in `recorder.rs`'s file paths) isn't
+sanitized against MQTT-reserved topic characters (`/`, `+`, `#`) — an
+accepted limitation for a single-operator CLI, not a real risk given who
+names the channels.
+
+**Fire-and-forget, same posture as Drive upload**: `MqttPublisher::publish`
+is a sync method that builds the topic/payload and then `tokio::spawn`s a
+task to actually await the publish, rather than awaiting it inline. This
+isn't just defensive — `rumqttc`'s own docs note `AsyncClient::publish(...)
+.await` can block on internal backpressure if the event loop isn't keeping
+up (broker down/slow), which is exactly the same "one stalled network call
+hangs a long-lived loop forever" failure class this project already hit
+once with a timeout-less `reqwest::Client` (see the ring-buffer section
+above). QoS is `AtLeastOnce`, not retained: at-least-once gives real
+delivery assurance without QoS 2's extra handshake, and *not* retained
+because this is an event stream, not a state topic — a retained "last
+motion" value would misrepresent old motion as fresh to a newly-connecting
+subscriber. An MQTT publish failure never affects `event_log` or clip
+recording, same as a Drive upload failure never rolls back the local clip.
+
+**The event loop must be driven, or nothing happens at all — not even the
+initial connect**: `rumqttc::AsyncClient::new` returns a client handle and
+a separate `EventLoop`; nothing (connect, publish, ping, reconnect) actually
+happens until something calls `eventloop.poll().await` in a loop.
+`MqttPublisher::connect` spawns exactly one detached `tokio::spawn` task to
+own and drive this for the life of the process — same "no shutdown signal
+needed, no OS resource owned" reasoning as `gdrive::start_retention_sweep`.
+Reconnection itself is automatic as long as `poll()` keeps being called
+after an `Err` rather than abandoned; there's a flat 1s `sleep` between
+retries in that error branch specifically because the crate documents no
+built-in backoff, and a bare retry loop against a broker that's down for a
+while would otherwise busy-spin.
+
+**Non-obvious explicit-timeout gotcha, worth remembering**: the initial
+connect timeout is *not* a `MqttOptions` setting — `set_keep_alive` governs
+an already-established connection's ping cadence, not how long to wait for
+the first connect. The actual knob is `EventLoop.network_options` (a public
+field on the `EventLoop` returned by `AsyncClient::new`, not `MqttOptions`)
+via `.set_connection_timeout(secs)`, called explicitly in
+`MqttPublisher::connect` right after construction — same explicit-timeout
+rule as `ImouClient::new`'s 20s `reqwest` timeout and `GDriveClient::new`'s
+180s one, applied here because this codebase has a documented incident
+where a network call with no timeout silently hung a long-lived loop
+forever with no crash and no error to signal it.
+
 ## Production deployment
 
 See [`deploy/README.md`](../deploy/README.md) — `imou listen` as a

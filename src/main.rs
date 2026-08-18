@@ -6,6 +6,7 @@ mod event_log;
 mod gdrive;
 mod listen;
 mod motion_event;
+mod mqtt;
 mod recorder;
 mod signing;
 mod token_cache;
