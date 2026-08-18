@@ -253,6 +253,102 @@ and lose pre-roll; this is a real, accepted limitation of push, not a bug.
 conversion against a real captured payload — pure logic, no live API
 needed, unlike most other verification in this project.
 
+## Google Drive clip upload (`src/gdrive/`)
+
+Both `watch` and `listen` optionally upload each extracted clip to Google
+Drive right after a successful local save, deleting the local `.mp4` only
+if the upload succeeds — the local copy stays as the fallback on any
+upload failure (network down, bad token, etc.), matching this project's
+general "detection/recording must never depend on a remote call
+succeeding" posture. `recorder::extract_clip` now returns the written
+`PathBuf` (previously `Result<()>`) so `recorder::spawn_clip_extraction`
+has something to hand to `gdrive::upload_and_replace`; the upload itself
+runs inside the same detached per-alarm task extraction already used
+(fire-and-forget, errors only `eprintln!`'d — see the ring-buffer section
+above), so a slow or failed upload never blocks `watch`'s poll loop or
+`listen`'s push HTTP handler. The feature is entirely opt-in: if
+`gdrive::config_from_env()` returns `None` (no `GDRIVE_CLIENT_ID`/
+`GDRIVE_CLIENT_SECRET` in the environment), `watch`/`listen` pass `None`
+through to every `spawn_clip_extraction` call and behavior is byte-for-byte
+identical to before this feature existed — same "no-op if unconfigured"
+convention as `recorder::local_config_for` for per-camera RTSP recording.
+
+**A plain service account does not work here — verified live, not assumed
+from docs.** The first implementation attempt used a Google service
+account (JWT-bearer OAuth, no interactive login) since it's the more
+natural fit for an unattended server process. It authenticates fine, but
+the real Drive API rejects the actual upload with `403
+storageQuotaExceeded`: *"Service Accounts do not have storage quota.
+Leverage shared drives, or use OAuth delegation instead."* Service accounts
+can only write into a Shared Drive or via domain-wide delegation — both
+Google Workspace-only features, unavailable for uploading into a personal
+Google account's ordinary "My Drive" folder. The shipped implementation
+instead uses **real user OAuth** via Google's device-code flow
+(`gdrive::device_flow::run_login`, wired to the `imou gdrive-login`
+subcommand) — no local redirect URI or browser needed on the server itself
+(the user opens the printed `verification_url` and enters `user_code` on
+any other device), and uploads count against the authorizing user's own,
+normal storage quota. This is a case worth remembering for this project's
+established "verify against the real API, don't trust what looks like the
+obviously-correct design" practice — service-account auth being simpler to
+implement and more idiomatic for a headless deployment did not make it
+correct here.
+
+`gdrive::auth` persists `{refresh_token, access_token, expires_at}` to
+`.gdrive_token_cache.json` via a generalized `token_cache::{load,save}`
+(now generic over any `Serialize`/`DeserializeOwned` type + an explicit
+path, rather than hardcoded to Imou's access token — `client.rs` passes
+`.imou_token_cache.json` explicitly and keeps its own private `CachedToken`
+type). Unlike Imou's access token, which re-fetches itself automatically
+from `appId`/`appSecret` with no user interaction, losing this file means
+the user has to redo the manual OAuth consent — so **it must be
+bind-mounted** in the Docker deploy (`deploy/docker-compose.yaml`), unlike
+`.imou_token_cache.json`, which isn't mounted at all because it doesn't
+need to be.
+
+`gdrive::upload` uses Drive API v3's **resumable** upload (a metadata-only
+POST to open a session, then a single PUT of the whole file to the
+returned session `Location`) rather than a one-shot multipart request —
+Google's recommendation for anything beyond trivially small files, and
+more resilient to a flaky home uplink given clips can be tens of MB. The
+whole file is read into memory (`tokio::fs::read`) rather than streamed —
+an accepted v1 simplification, not a hard limitation of the resumable
+protocol itself; revisit if clip sizes grow substantially.
+`gdrive::GDriveClient` uses an explicit 180s `reqwest` timeout (longer than
+`ImouClient`'s 20s, since uploads move real file bytes instead of small
+JSON payloads) — see the ring-buffer section's note on why an explicit
+timeout matters structurally for any network call inside a long-lived
+process.
+
+**Per-day folders + retention (`src/gdrive/folders.rs`,
+`src/gdrive/retention.rs`)**: every clip is uploaded into a `YYYY-MM-DD`
+Drive folder (the alarm's *local* date — `recorder::alarm_local_time`,
+shared with `extract_clip` so both always agree on which day a clip
+belongs to) directly under the configured `GDRIVE_FOLDER_ID` root,
+created via `folders::ensure_day_folder` if it doesn't exist yet. Folder
+lookup/creation results are cached in-memory on `GDriveClient` (`HashMap`
+behind a `Mutex`, keyed by the `YYYY-MM-DD` name) — this doubles as a lock
+held across the whole "check cache, else list-or-create Drive folder, then
+cache" sequence, so two clips from different channels finishing upload at
+nearly the same moment can't race into creating two folders for the same
+day. `retention::start_retention_sweep` runs once at startup and then
+every 24h for as long as the process runs (`watch`/`listen`'s
+`--gdrive-retention-days`, default 30, `0` = keep forever): lists the day
+folders directly under the root, parses each name as a date, and
+permanently **deletes** (not trashes, same semantics as
+`recorder::cleanup_old_segments` for local segments) any older than the
+retention window — deleting a Drive folder cascades to everything inside
+it that has no other parent, so this alone reclaims the clips too, no need
+to enumerate files individually. Folders whose name doesn't parse as
+`YYYY-MM-DD` are left untouched, so the sweep only ever acts on folders
+this app could plausibly have created itself. The sweep task is a plain
+detached `tokio::spawn` with no shutdown signal — unlike the ring-buffer
+recorders, it doesn't hold an OS resource (no child process to kill), so
+there's no orphan risk in just letting tokio drop it at process exit.
+Verified live: day-folder creation, reuse of an existing day folder on a
+second upload the same day, and the retention sweep actually deleting an
+old (synthetically dated) folder.
+
 ## Production deployment
 
 See [`deploy/README.md`](../deploy/README.md) — `imou listen` as a

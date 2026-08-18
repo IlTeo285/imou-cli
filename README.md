@@ -144,6 +144,30 @@ sizes the local recording buffer's retention against this uncertainty — a
 channel's pre-roll can only be recovered if the buffer is still holding it
 by the time a delayed push actually arrives.
 
+### Google Drive clip upload (optional)
+
+Both `watch` and `listen` upload each recorded clip to Google Drive right
+after saving it locally, deleting the local `.mp4` only once the upload
+succeeds (it stays as a fallback if the upload fails). Set
+`GDRIVE_CLIENT_ID`/`GDRIVE_CLIENT_SECRET` in `.env` (a Google Cloud OAuth
+client of type "TVs and Limited Input devices" — see `.env.example`), then
+run the one-time device-code login:
+
+```sh
+cargo run -- gdrive-login
+```
+
+Follow the printed URL and code, then `watch`/`listen` upload automatically
+from then on. Leaving these unset keeps the exact same local-only behavior
+as before. A Google *service account* does not work for this — see
+CLAUDE.md for why.
+
+Clips are organized into a `YYYY-MM-DD` folder per day (the alarm's local
+date), created automatically under `GDRIVE_FOLDER_ID` the first time it's
+needed. `--gdrive-retention-days` (default 30, both `watch` and `listen`)
+permanently deletes day folders older than that many days once every 24h;
+`0` keeps everything forever.
+
 For production deployment (Docker, behind Caddy, video/logs on mapped host
 directories), see [`deploy/README.md`](./deploy/README.md).
 

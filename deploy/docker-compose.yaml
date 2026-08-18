@@ -16,6 +16,12 @@ services:
       - ./data/clips:/app/clips
       - ./data/logs:/app/logs
       - ./data/ring_buffer:/app/ring_buffer
+      # Google Drive refresh token, obtained once via `docker compose run
+      # --rm imou-cli gdrive-login` (see deploy/README.md) — must be
+      # bind-mounted, or a container recreate loses it and forces the user
+      # to redo OAuth consent. `touch` this file on the host before the
+      # first `up -d`, or Docker creates it as a directory instead.
+      - ./data/gdrive_token_cache.json:/app/.gdrive_token_cache.json
     command:
       - listen
       - https://your-domain.example.com:8443/imou-callback # replace with your registered callback URL
@@ -23,6 +29,9 @@ services:
       - --events-file=/app/logs/motion_events.jsonl
       - --clips-dir=/app/clips
       - --buffer-dir=/app/ring_buffer
+      # Only takes effect if GDRIVE_CLIENT_ID/GDRIVE_CLIENT_SECRET are set
+      # in .env; ignored otherwise. 0 = keep uploaded clips forever.
+      - --gdrive-retention-days=30
 
   imou-caddy:
     image: caddy:2

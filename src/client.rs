@@ -1,10 +1,35 @@
+use std::path::Path;
+
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
 
 use crate::config::Config;
 use crate::error::{ImouError, Result};
 use crate::signing::sign_request;
-use crate::token_cache::{self, CachedToken};
+use crate::token_cache;
+
+const TOKEN_CACHE_PATH: &str = ".imou_token_cache.json";
+
+/// Access tokens are valid for ~3 days (see accessToken.html), so we persist
+/// the token to disk between CLI invocations instead of fetching a new one
+/// on every run — repeated fetches are wasteful and count against API quota.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct CachedToken {
+    access_token: String,
+    /// Unix timestamp (seconds) after which the token should be treated as expired.
+    expires_at: u64,
+}
+
+impl CachedToken {
+    fn is_valid(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Refresh a bit early to avoid racing expiry mid-request.
+        now + 60 < self.expires_at
+    }
+}
 
 pub struct ImouClient {
     http: reqwest::Client,
@@ -138,7 +163,7 @@ impl ImouClient {
     }
 
     async fn get_access_token(&self) -> Result<String> {
-        if let Some(cached) = token_cache::load()
+        if let Some(cached) = token_cache::load::<CachedToken>(Path::new(TOKEN_CACHE_PATH))
             && cached.is_valid()
         {
             return Ok(cached.access_token);
@@ -165,7 +190,7 @@ impl ImouClient {
             access_token: data.access_token.clone(),
             expires_at: now + data.expire_time,
         };
-        token_cache::save(&cached)?;
+        token_cache::save(Path::new(TOKEN_CACHE_PATH), &cached)?;
 
         Ok(data.access_token)
     }

@@ -16,6 +16,9 @@ pub enum ImouError {
 
     #[error("missing configuration: {0}")]
     Config(String),
+
+    #[error("Google Drive error: {0}")]
+    GDrive(String),
 }
 
 pub type Result<T> = std::result::Result<T, ImouError>;

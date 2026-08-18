@@ -3,6 +3,7 @@ mod client;
 mod config;
 mod error;
 mod event_log;
+mod gdrive;
 mod listen;
 mod motion_event;
 mod recorder;
@@ -79,6 +80,11 @@ enum Command {
         pre_roll_secs: u64,
         #[arg(long, default_value_t = 60)]
         post_roll_secs: u64,
+        /// How long to keep uploaded clips on Google Drive before deleting
+        /// them (0 = keep forever). Only relevant if Google Drive upload is
+        /// configured (see `gdrive-login`) — ignored otherwise.
+        #[arg(long, default_value_t = 30)]
+        gdrive_retention_days: u32,
     },
     /// Run a foreground service that registers a push callback with Imou
     /// and reacts to motion events as they're delivered — no polling.
@@ -107,7 +113,16 @@ enum Command {
         /// delivery, for sizing the local recording buffer's retention.
         #[arg(long, default_value_t = 300)]
         max_push_latency_secs: u64,
+        /// How long to keep uploaded clips on Google Drive before deleting
+        /// them (0 = keep forever). Only relevant if Google Drive upload is
+        /// configured (see `gdrive-login`) — ignored otherwise.
+        #[arg(long, default_value_t = 30)]
+        gdrive_retention_days: u32,
     },
+    /// One-time OAuth setup for Google Drive clip upload (`watch`/`listen`
+    /// upload automatically once this has been run — see CLAUDE.md).
+    /// Requires `GDRIVE_CLIENT_ID`/`GDRIVE_CLIENT_SECRET` in `.env`.
+    GdriveLogin,
 }
 
 #[tokio::main]
@@ -168,6 +183,7 @@ async fn main() -> anyhow::Result<()> {
             buffer_dir,
             pre_roll_secs,
             post_roll_secs,
+            gdrive_retention_days,
         } => {
             watch::run(
                 &client,
@@ -177,6 +193,7 @@ async fn main() -> anyhow::Result<()> {
                 &clips_dir,
                 Duration::from_secs(pre_roll_secs),
                 Duration::from_secs(post_roll_secs),
+                gdrive_retention_days,
             )
             .await?;
         }
@@ -189,6 +206,7 @@ async fn main() -> anyhow::Result<()> {
             pre_roll_secs,
             post_roll_secs,
             max_push_latency_secs,
+            gdrive_retention_days,
         } => {
             listen::run(
                 &client,
@@ -200,8 +218,17 @@ async fn main() -> anyhow::Result<()> {
                 Duration::from_secs(pre_roll_secs),
                 Duration::from_secs(post_roll_secs),
                 Duration::from_secs(max_push_latency_secs),
+                gdrive_retention_days,
             )
             .await?;
+        }
+        Command::GdriveLogin => {
+            let cfg = gdrive::config_from_env().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "GDRIVE_CLIENT_ID / GDRIVE_CLIENT_SECRET must be set in .env before running gdrive-login"
+                )
+            })?;
+            gdrive::run_login(&cfg).await?;
         }
     }
 

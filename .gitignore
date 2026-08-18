@@ -1,6 +1,7 @@
 /target
 .env
 .imou_token_cache.json
+.gdrive_token_cache.json
 motion_events.jsonl
 .imou_ring_buffer/
 clips/

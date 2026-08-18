@@ -29,7 +29,11 @@ before deploying:
    they survive container restarts/recreates):
    ```sh
    mkdir -p ~/imou-cli/data/{clips,logs,ring_buffer}
+   touch ~/imou-cli/data/gdrive_token_cache.json
    ```
+   The `touch` matters even if you're not using Google Drive upload: Docker
+   creates a bind-mounted path that doesn't exist yet as a **directory**,
+   which then breaks `gdrive-login` later if you enable it.
 
 2. Copy `deploy/docker-compose.yaml` and `deploy/Caddyfile` into
    `~/imou-cli/`, and edit both: replace `your-domain.example.com` with your
@@ -51,6 +55,18 @@ before deploying:
    cd ~/imou-cli
    docker compose up -d
    ```
+
+6. **Optional — Google Drive clip upload**: if `GDRIVE_CLIENT_ID`/
+   `GDRIVE_CLIENT_SECRET` are set in `.env`, authorize once (the device-code
+   flow just prints a URL + code to the terminal — no browser needed on the
+   server itself, complete it on your phone or laptop):
+   ```sh
+   docker compose run --rm imou-cli gdrive-login
+   ```
+   This writes the refresh token to `./data/gdrive_token_cache.json`
+   (bind-mounted into the container — see `docker-compose.yaml`), so it
+   survives future `docker compose up -d` recreates and doesn't need to be
+   redone on every deploy.
 
 ## Verification
 
@@ -76,3 +92,9 @@ before deploying:
    restart (bind mounts, not anonymous volumes, so they should); the
    callback registration itself is untouched by this, since `listen` never
    calls `setMessageCallback`.
+6. If Google Drive upload is configured: after step 4's real motion event,
+   confirm the clip also appears in the target Drive folder, and that
+   `~/imou-cli/data/clips/<channel>/...mp4` is gone afterward (deleted only
+   on a successful upload — see CLAUDE.md). A `docker compose up -d
+   --force-recreate` afterward should not require re-running
+   `gdrive-login`, confirming the token cache bind mount actually persists.

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Local};
@@ -9,6 +10,7 @@ use crate::api::alarm::Alarm;
 use crate::client::ImouClient;
 use crate::error::Result;
 use crate::event_log::EventLog;
+use crate::gdrive;
 use crate::motion_event::MotionEvent;
 use crate::recorder;
 
@@ -97,6 +99,7 @@ pub async fn run(
     clips_dir: &Path,
     pre_roll: Duration,
     post_roll: Duration,
+    gdrive_retention_days: u32,
 ) -> Result<()> {
     let event_log = EventLog::open(events_file)?;
 
@@ -130,6 +133,17 @@ pub async fn run(
     let retention = pre_roll + interval + RETENTION_MARGIN;
 
     let recording = recorder::start_all(&channels, buffer_dir, retention).await?;
+
+    let gdrive_client = gdrive::config_from_env().map(|cfg| Arc::new(gdrive::GDriveClient::new(cfg)));
+    match &gdrive_client {
+        Some(client) => {
+            println!("uploading clips to Google Drive (retention: {gdrive_retention_days}d, 0 = forever)");
+            gdrive::start_retention_sweep(client.clone(), gdrive_retention_days);
+        }
+        None => println!(
+            "Google Drive upload not configured (GDRIVE_CLIENT_ID/GDRIVE_CLIENT_SECRET not set) — clips stay local only"
+        ),
+    }
 
     println!(
         "watching {} channel(s) across {} device(s), polling every {}s, writing motion events to {}",
@@ -173,6 +187,7 @@ pub async fn run(
                                 alarm,
                                 pre_roll,
                                 post_roll,
+                                gdrive_client.clone(),
                             );
                         }
                     }

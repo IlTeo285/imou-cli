@@ -4,4 +4,5 @@ clips/
 .imou_ring_buffer/
 motion_events.jsonl
 .imou_token_cache.json
+.gdrive_token_cache.json
 .env

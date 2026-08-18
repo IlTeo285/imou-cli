@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Local, NaiveDateTime, Utc};
@@ -11,10 +12,21 @@ use tokio::task::JoinHandle;
 
 use crate::api::alarm::Alarm;
 use crate::error::{ImouError, Result};
+use crate::gdrive::{self, GDriveClient};
 
 const SEGMENT_TIME_SECS: u32 = 2;
 const SEGMENT_TS_FMT: &str = "%Y%m%dT%H%M%S";
 const RESTART_BACKOFF: StdDuration = StdDuration::from_secs(5);
+/// Passed to ffmpeg's RTSP-demuxer-private `-timeout` option (microseconds;
+/// the generic `-rw_timeout` AVOption is *not* honored by the rtsp demuxer
+/// itself — confirmed live, ffmpeg rejects it with "Option not found" when
+/// `-rtsp_transport tcp` is in play) so a stalled RTSP TCP connection
+/// (half-open, no data, no error) makes ffmpeg exit instead of hanging
+/// forever — without this, a stalled camera connection silently stops
+/// producing segments but the process never exits, so the auto-restart loop
+/// below (which only triggers on exit) never fires. Same failure class
+/// documented in CLAUDE.md for the `watch` poll loop.
+const RTSP_READ_TIMEOUT_USECS: u64 = 15_000_000;
 const CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(5);
 /// Extra time to wait past a segment's nominal start before trusting it
 /// covers that instant, and past a clip window's end before assuming
@@ -144,7 +156,11 @@ pub async fn shutdown_all(setup: RecordingSetup) {
 
 /// Spawns `extract_clip` as a detached task — used by both `watch` and
 /// `listen` so a slow clip extraction never blocks their respective
-/// detection loops (polling / the push HTTP handler).
+/// detection loops (polling / the push HTTP handler). If `gdrive` is
+/// configured, a successfully extracted clip is also uploaded and the
+/// local file removed on success — same fire-and-forget/log-only error
+/// handling as extraction itself, and the same "no-op if unconfigured"
+/// convention as `local_config_for`.
 pub fn spawn_clip_extraction(
     channel_name: String,
     buffer_dir: PathBuf,
@@ -152,12 +168,26 @@ pub fn spawn_clip_extraction(
     alarm: Alarm,
     pre_roll: StdDuration,
     post_roll: StdDuration,
+    gdrive: Option<Arc<GDriveClient>>,
 ) {
     tokio::spawn(async move {
-        if let Err(e) =
-            extract_clip(&channel_name, &buffer_dir, &clips_dir, &alarm, pre_roll, post_roll).await
-        {
-            eprintln!("warning: clip extraction failed for {channel_name}: {e}");
+        match extract_clip(&channel_name, &buffer_dir, &clips_dir, &alarm, pre_roll, post_roll).await {
+            Ok(out_path) => {
+                if let Some(client) = gdrive {
+                    let date = alarm_local_time(&alarm).map(|dt| dt.date_naive());
+                    let upload_result = match date {
+                        Ok(date) => gdrive::upload_and_replace(&client, &out_path, &channel_name, date).await,
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = upload_result {
+                        eprintln!(
+                            "warning: Google Drive upload failed for {channel_name}: {e} (clip kept locally at {})",
+                            out_path.display()
+                        );
+                    }
+                }
+            }
+            Err(e) => eprintln!("warning: clip extraction failed for {channel_name}: {e}"),
         }
     });
 }
@@ -241,6 +271,8 @@ async fn run_recorder_supervisor(
                 "warning",
                 "-rtsp_transport",
                 "tcp",
+                "-timeout",
+                &RTSP_READ_TIMEOUT_USECS.to_string(),
                 "-i",
                 &rtsp_url,
                 "-c",
@@ -331,9 +363,26 @@ async fn cleanup_old_segments(dir: &Path, retention: StdDuration) -> Result<()> 
     Ok(())
 }
 
+/// Parses `alarm.utc_time` into the account's local wall-clock time — same
+/// convention as `Alarm`'s own doc note. Shared by `extract_clip` (to place
+/// the pre/post-roll window) and by `spawn_clip_extraction` (to pick the
+/// day folder a Google Drive upload belongs in), so both always agree on
+/// which day a clip belongs to.
+fn alarm_local_time(alarm: &Alarm) -> Result<DateTime<Local>> {
+    alarm
+        .utc_time
+        .parse::<i64>()
+        .ok()
+        .and_then(|secs| DateTime::<Utc>::from_timestamp(secs, 0))
+        .map(|dt| dt.with_timezone(&Local))
+        .ok_or_else(|| ImouError::Config(format!("alarm {} has invalid utc_time", alarm.alarm_id)))
+}
+
 /// Waits for the buffer to have accumulated `alarm.utc_time - pre_roll ..
 /// alarm.utc_time + post_roll`, then concatenates the covering segments
-/// into `<clips_dir>/<channel_name>/<local-time>_<alarm_id>.mp4`.
+/// into `<clips_dir>/<channel_name>/<local-time>_<alarm_id>.mp4`. Returns
+/// the written file's path so callers (e.g. a Google Drive upload step)
+/// know what to act on next.
 pub async fn extract_clip(
     channel_name: &str,
     buffer_dir: &Path,
@@ -341,14 +390,8 @@ pub async fn extract_clip(
     alarm: &Alarm,
     pre_roll: StdDuration,
     post_roll: StdDuration,
-) -> Result<()> {
-    let alarm_instant_utc = alarm
-        .utc_time
-        .parse::<i64>()
-        .ok()
-        .and_then(|secs| DateTime::<Utc>::from_timestamp(secs, 0))
-        .ok_or_else(|| ImouError::Config(format!("alarm {} has invalid utc_time", alarm.alarm_id)))?;
-    let alarm_local = alarm_instant_utc.with_timezone(&Local);
+) -> Result<PathBuf> {
+    let alarm_local = alarm_local_time(alarm)?;
 
     let window_start = alarm_local - chrono::Duration::from_std(pre_roll).unwrap();
     let window_end = alarm_local + chrono::Duration::from_std(post_roll).unwrap();
@@ -425,5 +468,5 @@ pub async fn extract_clip(
     }
 
     println!("clip saved: {}", out_path.display());
-    Ok(())
+    Ok(out_path)
 }
