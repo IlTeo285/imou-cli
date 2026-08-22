@@ -147,11 +147,12 @@ by the time a delayed push actually arrives.
 ### Google Drive clip upload (optional)
 
 Both `watch` and `listen` upload each recorded clip to Google Drive right
-after saving it locally, deleting the local `.mp4` only once the upload
-succeeds (it stays as a fallback if the upload fails). Set
-`GDRIVE_CLIENT_ID`/`GDRIVE_CLIENT_SECRET` in `.env` (a Google Cloud OAuth
-client of type "TVs and Limited Input devices" — see `.env.example`), then
-run the one-time device-code login:
+after saving it locally. The local copy is **not** deleted on a successful
+upload — local and Drive copies age out independently, on their own
+retention windows (see `--local-retention-days` / `--gdrive-retention-days`
+below). Set `GDRIVE_CLIENT_ID`/`GDRIVE_CLIENT_SECRET` in `.env` (a Google
+Cloud OAuth client of type "TVs and Limited Input devices" — see
+`.env.example`), then run the one-time device-code login:
 
 ```sh
 cargo run -- gdrive-login
@@ -167,6 +168,12 @@ date), created automatically under `GDRIVE_FOLDER_ID` the first time it's
 needed. `--gdrive-retention-days` (default 30, both `watch` and `listen`)
 permanently deletes day folders older than that many days once every 24h;
 `0` keeps everything forever.
+
+Local clips under `--clips-dir` have their own, separate retention:
+`--local-retention-days` (default 30, both `watch` and `listen`) deletes
+clips older than that many days once every 24h, regardless of whether
+Google Drive upload is configured or how long its own retention keeps
+them; `0` keeps them forever.
 
 For production deployment (Docker, behind Caddy, video/logs on mapped host
 directories), see [`deploy/README.md`](./deploy/README.md).
