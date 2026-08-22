@@ -8,6 +8,11 @@ use crate::api::alarm::Alarm;
 /// `Alarm` from their respective data sources before calling this.
 #[derive(Debug, Serialize)]
 pub struct MotionEvent {
+    /// Always `"motion"` — distinguishes this line from a later
+    /// `MotionAnalysisEvent` line for the same `alarm_id` in the same
+    /// append-only file. Additive: existing consumers reading known keys
+    /// are unaffected by this field's presence.
+    kind: &'static str,
     /// True UTC instant (RFC3339), from `Alarm::utc_time`.
     time: String,
     /// Account-local wall-clock time (same convention as `beginTime`/
@@ -45,6 +50,7 @@ impl MotionEvent {
             .unwrap_or_else(|| alarm.time.to_string());
 
         MotionEvent {
+            kind: "motion",
             time,
             local_time,
             device_id: alarm.device_id.clone(),
@@ -54,6 +60,45 @@ impl MotionEvent {
             alarm_name: alarm.name.clone(),
             alarm_type: alarm.alarm_type.clone(),
             label_type: alarm.label_type.clone(),
+        }
+    }
+}
+
+/// A second, deferred line appended to the same events file once AI
+/// analysis of a clip completes — correlated to the original `MotionEvent`
+/// line by `alarm_id`. Deferred because analysis can only run after the
+/// clip itself is extracted (see `recorder::spawn_clip_extraction`), well
+/// after the immediate `MotionEvent`/MQTT notification already fired; see
+/// CLAUDE.md's note on why the fast path is never delayed to wait for it.
+#[derive(Debug, Serialize)]
+pub struct MotionAnalysisEvent {
+    kind: &'static str,
+    alarm_id: String,
+    channel_name: String,
+    /// True UTC instant (RFC3339) when analysis completed.
+    time: String,
+    category: String,
+    relevant: bool,
+    description: String,
+    uploaded_to_gdrive: bool,
+}
+
+impl MotionAnalysisEvent {
+    pub fn new(
+        alarm: &Alarm,
+        channel_name: &str,
+        result: &imou_vision::AnalysisResult,
+        uploaded_to_gdrive: bool,
+    ) -> Self {
+        MotionAnalysisEvent {
+            kind: "motion_analyzed",
+            alarm_id: alarm.alarm_id.clone(),
+            channel_name: channel_name.to_string(),
+            time: Utc::now().to_rfc3339(),
+            category: result.category.to_string(),
+            relevant: result.relevant,
+            description: result.description.clone(),
+            uploaded_to_gdrive,
         }
     }
 }

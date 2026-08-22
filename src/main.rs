@@ -21,6 +21,7 @@ use clap::{Parser, Subcommand};
 use api::ptz::Direction;
 use client::ImouClient;
 use config::Config;
+use recorder::FilenameTimezone;
 
 #[derive(Parser)]
 #[command(name = "imou", about = "CLI for the Imou Open Platform")]
@@ -77,6 +78,35 @@ enum Command {
         clips_dir: PathBuf,
         #[arg(long, default_value = ".imou_ring_buffer")]
         buffer_dir: PathBuf,
+        /// Where per-clip frame-diff snapshots are saved (see CLAUDE.md's
+        /// "snapshot" section) — always on, no configuration required: it's
+        /// local pixel arithmetic, not a network/credentialed integration.
+        #[arg(long, default_value = "snapshots")]
+        snapshots_dir: PathBuf,
+        /// How many distinct snapshots to save per clip (the most visually
+        /// different moments, spaced at least a couple seconds apart).
+        #[arg(long, default_value_t = 1)]
+        snapshot_count: u8,
+        /// Where the continuous (non-motion-triggered) recording archive is
+        /// saved, if enabled via `--continuous-retention-hours`. Written by
+        /// the same ffmpeg process as the pre-roll ring buffer (see
+        /// CLAUDE.md's "Continuous recording" section), one `.mp4` per
+        /// `--continuous-segment-minutes`.
+        #[arg(long, default_value = "continuous")]
+        continuous_dir: PathBuf,
+        /// Length of each continuous-archive segment. Shorter segments mean
+        /// more files but a shorter wait before the most recent footage is
+        /// reliably playable (an in-progress segment's .mp4 isn't finalized
+        /// until it rotates) — see CLAUDE.md.
+        #[arg(long, default_value_t = 15)]
+        continuous_segment_minutes: u32,
+        /// How long to keep the continuous archive (0 = feature disabled —
+        /// unlike every other `--*-retention-*` flag in this CLI, `0` here
+        /// does NOT mean "keep forever": continuous recording is costly
+        /// enough (tens of GB/camera/day) that it needs an explicit opt-in,
+        /// not just an always-on sweep. Set e.g. 48 for "last 2 days".
+        #[arg(long, default_value_t = 0)]
+        continuous_retention_hours: u32,
         #[arg(long, default_value_t = 30)]
         pre_roll_secs: u64,
         #[arg(long, default_value_t = 60)]
@@ -89,9 +119,34 @@ enum Command {
         /// How long to keep clips in `--clips-dir` before deleting them (0 =
         /// keep forever). Independent of `--gdrive-retention-days` — a clip
         /// uploaded to Drive is no longer deleted locally on upload success,
-        /// so this is what now bounds local disk usage.
+        /// so this is what now bounds local disk usage. Also governs
+        /// `--snapshots-dir` (same policy, separate sweep).
         #[arg(long, default_value_t = 30)]
         local_retention_days: u32,
+        /// Only relevant if AI analysis is configured
+        /// (AI_OLLAMA_URL/AI_MODEL_NAME in the environment). When true,
+        /// Google Drive upload is skipped for clips the AI classifies as
+        /// not relevant (e.g. an empty scene). Default false: AI results
+        /// are logged and published for visibility, but existing upload
+        /// behavior is unchanged until explicitly opted into.
+        #[arg(long, default_value_t = false)]
+        ai_gate_gdrive_upload: bool,
+        /// Only relevant if AI analysis is configured. When true, the
+        /// `.../motion-analyzed` MQTT message is only published for clips
+        /// the AI found relevant. Default false: always publish (with a
+        /// `relevant` field) so downstream automations can filter
+        /// themselves instead of risking a dropped notification.
+        #[arg(long, default_value_t = false)]
+        ai_gate_mqtt_analyzed: bool,
+        /// Wall-clock convention for every filename this process writes
+        /// (ring buffer/continuous segments, clips, snapshots) and the
+        /// retention sweeps that later parse those names back — does NOT
+        /// affect `local_time` in the JSON event log (always local) or the
+        /// Google Drive day-folder grouping (always the real local day).
+        /// `local` requires the container's own timezone to actually be
+        /// set correctly (e.g. `TZ=Europe/Rome`) — see CLAUDE.md.
+        #[arg(long, value_enum, default_value_t = FilenameTimezone::Local)]
+        filename_timezone: FilenameTimezone,
     },
     /// Run a foreground service that registers a push callback with Imou
     /// and reacts to motion events as they're delivered — no polling.
@@ -112,6 +167,35 @@ enum Command {
         clips_dir: PathBuf,
         #[arg(long, default_value = ".imou_ring_buffer")]
         buffer_dir: PathBuf,
+        /// Where per-clip frame-diff snapshots are saved (see CLAUDE.md's
+        /// "snapshot" section) — always on, no configuration required: it's
+        /// local pixel arithmetic, not a network/credentialed integration.
+        #[arg(long, default_value = "snapshots")]
+        snapshots_dir: PathBuf,
+        /// How many distinct snapshots to save per clip (the most visually
+        /// different moments, spaced at least a couple seconds apart).
+        #[arg(long, default_value_t = 1)]
+        snapshot_count: u8,
+        /// Where the continuous (non-motion-triggered) recording archive is
+        /// saved, if enabled via `--continuous-retention-hours`. Written by
+        /// the same ffmpeg process as the pre-roll ring buffer (see
+        /// CLAUDE.md's "Continuous recording" section), one `.mp4` per
+        /// `--continuous-segment-minutes`.
+        #[arg(long, default_value = "continuous")]
+        continuous_dir: PathBuf,
+        /// Length of each continuous-archive segment. Shorter segments mean
+        /// more files but a shorter wait before the most recent footage is
+        /// reliably playable (an in-progress segment's .mp4 isn't finalized
+        /// until it rotates) — see CLAUDE.md.
+        #[arg(long, default_value_t = 15)]
+        continuous_segment_minutes: u32,
+        /// How long to keep the continuous archive (0 = feature disabled —
+        /// unlike every other `--*-retention-*` flag in this CLI, `0` here
+        /// does NOT mean "keep forever": continuous recording is costly
+        /// enough (tens of GB/camera/day) that it needs an explicit opt-in,
+        /// not just an always-on sweep. Set e.g. 48 for "last 2 days".
+        #[arg(long, default_value_t = 0)]
+        continuous_retention_hours: u32,
         #[arg(long, default_value_t = 30)]
         pre_roll_secs: u64,
         #[arg(long, default_value_t = 60)]
@@ -128,9 +212,34 @@ enum Command {
         /// How long to keep clips in `--clips-dir` before deleting them (0 =
         /// keep forever). Independent of `--gdrive-retention-days` — a clip
         /// uploaded to Drive is no longer deleted locally on upload success,
-        /// so this is what now bounds local disk usage.
+        /// so this is what now bounds local disk usage. Also governs
+        /// `--snapshots-dir` (same policy, separate sweep).
         #[arg(long, default_value_t = 30)]
         local_retention_days: u32,
+        /// Only relevant if AI analysis is configured
+        /// (AI_OLLAMA_URL/AI_MODEL_NAME in the environment). When true,
+        /// Google Drive upload is skipped for clips the AI classifies as
+        /// not relevant (e.g. an empty scene). Default false: AI results
+        /// are logged and published for visibility, but existing upload
+        /// behavior is unchanged until explicitly opted into.
+        #[arg(long, default_value_t = false)]
+        ai_gate_gdrive_upload: bool,
+        /// Only relevant if AI analysis is configured. When true, the
+        /// `.../motion-analyzed` MQTT message is only published for clips
+        /// the AI found relevant. Default false: always publish (with a
+        /// `relevant` field) so downstream automations can filter
+        /// themselves instead of risking a dropped notification.
+        #[arg(long, default_value_t = false)]
+        ai_gate_mqtt_analyzed: bool,
+        /// Wall-clock convention for every filename this process writes
+        /// (ring buffer/continuous segments, clips, snapshots) and the
+        /// retention sweeps that later parse those names back — does NOT
+        /// affect `local_time` in the JSON event log (always local) or the
+        /// Google Drive day-folder grouping (always the real local day).
+        /// `local` requires the container's own timezone to actually be
+        /// set correctly (e.g. `TZ=Europe/Rome`) — see CLAUDE.md.
+        #[arg(long, value_enum, default_value_t = FilenameTimezone::Local)]
+        filename_timezone: FilenameTimezone,
     },
     /// One-time OAuth setup for Google Drive clip upload (`watch`/`listen`
     /// upload automatically once this has been run — see CLAUDE.md).
@@ -194,10 +303,18 @@ async fn main() -> anyhow::Result<()> {
             events_file,
             clips_dir,
             buffer_dir,
+            snapshots_dir,
+            snapshot_count,
+            continuous_dir,
+            continuous_segment_minutes,
+            continuous_retention_hours,
             pre_roll_secs,
             post_roll_secs,
             gdrive_retention_days,
             local_retention_days,
+            ai_gate_gdrive_upload,
+            ai_gate_mqtt_analyzed,
+            filename_timezone,
         } => {
             watch::run(
                 &client,
@@ -205,10 +322,18 @@ async fn main() -> anyhow::Result<()> {
                 &events_file,
                 &buffer_dir,
                 &clips_dir,
+                &snapshots_dir,
+                snapshot_count,
+                &continuous_dir,
+                continuous_segment_minutes,
+                continuous_retention_hours,
                 Duration::from_secs(pre_roll_secs),
                 Duration::from_secs(post_roll_secs),
                 gdrive_retention_days,
                 local_retention_days,
+                ai_gate_gdrive_upload,
+                ai_gate_mqtt_analyzed,
+                filename_timezone,
             )
             .await?;
         }
@@ -218,11 +343,19 @@ async fn main() -> anyhow::Result<()> {
             events_file,
             clips_dir,
             buffer_dir,
+            snapshots_dir,
+            snapshot_count,
+            continuous_dir,
+            continuous_segment_minutes,
+            continuous_retention_hours,
             pre_roll_secs,
             post_roll_secs,
             max_push_latency_secs,
             gdrive_retention_days,
             local_retention_days,
+            ai_gate_gdrive_upload,
+            ai_gate_mqtt_analyzed,
+            filename_timezone,
         } => {
             listen::run(
                 &client,
@@ -231,11 +364,19 @@ async fn main() -> anyhow::Result<()> {
                 &events_file,
                 &buffer_dir,
                 &clips_dir,
+                &snapshots_dir,
+                snapshot_count,
+                &continuous_dir,
+                continuous_segment_minutes,
+                continuous_retention_hours,
                 Duration::from_secs(pre_roll_secs),
                 Duration::from_secs(post_roll_secs),
                 Duration::from_secs(max_push_latency_secs),
                 gdrive_retention_days,
                 local_retention_days,
+                ai_gate_gdrive_upload,
+                ai_gate_mqtt_analyzed,
+                filename_timezone,
             )
             .await?;
         }

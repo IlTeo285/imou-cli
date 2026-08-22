@@ -745,9 +745,23 @@ dependencies = [
  "chrono",
  "clap",
  "dotenvy",
+ "imou-vision",
  "md-5",
  "reqwest",
  "rumqttc",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "imou-vision"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",

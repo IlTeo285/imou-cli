@@ -11,11 +11,25 @@ services:
     networks:
       - imou-network
     env_file:
+      # Includes TZ=... if set there — without it, the container defaults
+      # to UTC regardless of the host's own timezone (verified live — a
+      # bare Docker container has none configured out of the box), so
+      # every "local" filename this process writes (ffmpeg's `-strftime`,
+      # and this app's own `chrono::Local` calls) would silently be 1-2h
+      # off from the real local time. See `.env.example` and CLAUDE.md's
+      # note on `--filename-timezone`.
       - ./.env
     volumes:
       - ./data/clips:/app/clips
+      - ./data/snapshots:/app/snapshots
       - ./data/logs:/app/logs
       - ./data/ring_buffer:/app/ring_buffer
+      # Only actually used if --continuous-retention-hours is uncommented
+      # below. Uncomment this too in that case — otherwise the archive
+      # would be written to the container's own ephemeral filesystem and
+      # lost on recreate. Point this at a large/external disk if you have
+      # one (this can be tens of GB per camera per day).
+      # - ./data/continuous:/app/continuous
       # Google Drive refresh token, obtained once via `docker compose run
       # --rm imou-cli gdrive-login` (see deploy/README.md) — must be
       # bind-mounted, or a container recreate loses it and forces the user
@@ -29,14 +43,65 @@ services:
       - --events-file=/app/logs/motion_events.jsonl
       - --clips-dir=/app/clips
       - --buffer-dir=/app/ring_buffer
+      # Always on (no config/opt-in — it's local pixel arithmetic, not a
+      # network integration): one frame-diff snapshot per clip, saved
+      # under ./data/snapshots. See CLAUDE.md's "Frame-diff snapshot
+      # extraction" section.
+      - --snapshots-dir=/app/snapshots
+      - --snapshot-count=1
+      # Opt-in (unlike the flags above): records the ENTIRE video stream,
+      # not just motion clips, into a rolling window — tens of GB per
+      # camera per day. Uncomment both lines (and the volume above) to
+      # enable; --continuous-retention-hours=0 (the default) means OFF,
+      # not "keep forever" like every other retention flag here — see
+      # CLAUDE.md's "Continuous recording" section.
+      # - --continuous-dir=/app/continuous
+      # - --continuous-retention-hours=48
       # Only takes effect if GDRIVE_CLIENT_ID/GDRIVE_CLIENT_SECRET are set
       # in .env; ignored otherwise. 0 = keep uploaded clips forever.
       - --gdrive-retention-days=30
       # Independent of the Drive retention above — a clip uploaded to Drive
       # is no longer deleted locally on upload success, so this is what
       # bounds disk usage under ./data/clips (or wherever the volume above
-      # points, e.g. a mounted external disk). 0 = keep forever.
+      # points, e.g. a mounted external disk). Also governs
+      # ./data/snapshots (same policy, separate sweep). 0 = keep forever.
       - --local-retention-days=30
+      # Both no-ops unless AI_OLLAMA_URL/AI_MODEL_NAME are set in .env (see
+      # below) — AI analysis itself is always logged/published once
+      # configured; these two flags additionally gate the existing Drive
+      # upload / motion-analyzed MQTT publish on the AI's verdict.
+      # - --ai-gate-gdrive-upload
+      # - --ai-gate-mqtt-analyzed
+      # Default is already "local" — only need this line to switch to UTC
+      # filenames instead. See CLAUDE.md's "Continuous recording"/snapshot
+      # sections and the `TZ` note above (local mode needs a correctly set
+      # container timezone to actually produce local-looking filenames).
+      # - --filename-timezone=utc
+    depends_on:
+      # Soft dependency only (no readiness/health-check gate): imou-cli's
+      # AI analysis is fail-open, so it starting before Ollama has finished
+      # loading a model is harmless — clips are just logged/uploaded as if
+      # AI weren't configured until Ollama responds.
+      - imou-ollama
+
+  # Optional — only actually used if AI_OLLAMA_URL/AI_MODEL_NAME are set in
+  # .env. Runs a local vision-language model imou-cli calls per extracted
+  # clip to classify its content (human/animal/vehicle/...) — see
+  # CLAUDE.md's AI video-content analysis section. Not exposed to the host
+  # by default; imou-cli reaches it over imou-network.
+  imou-ollama:
+    image: ollama/ollama:latest
+    container_name: imou-ollama
+    restart: unless-stopped
+    networks:
+      - imou-network
+    volumes:
+      # Persists pulled model weights across container recreates — without
+      # this, a redeploy would require re-running `ollama pull` every time.
+      - ./data/ollama:/root/.ollama
+    # Uncomment to pull models or debug directly from the host:
+    # ports:
+    #   - "11434:11434"
 
   imou-caddy:
     image: caddy:2

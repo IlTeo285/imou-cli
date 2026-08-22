@@ -98,12 +98,20 @@ pub async fn run(
     events_file: &Path,
     buffer_dir: &Path,
     clips_dir: &Path,
+    snapshots_dir: &Path,
+    snapshot_count: u8,
+    continuous_dir: &Path,
+    continuous_segment_minutes: u32,
+    continuous_retention_hours: u32,
     pre_roll: Duration,
     post_roll: Duration,
     gdrive_retention_days: u32,
     local_retention_days: u32,
+    ai_gate_gdrive_upload: bool,
+    ai_gate_mqtt_analyzed: bool,
+    filename_tz: recorder::FilenameTimezone,
 ) -> Result<()> {
-    let event_log = EventLog::open(events_file)?;
+    let event_log = Arc::new(EventLog::open(events_file)?);
 
     let devices = api::devices::list(client, 100).await?;
     let mut channels = Vec::new();
@@ -134,10 +142,22 @@ pub async fn run(
     // gone from the buffer by the time an alarm is actually discovered.
     let retention = pre_roll + interval + RETENTION_MARGIN;
 
-    let recording = recorder::start_all(&channels, buffer_dir, retention).await?;
+    let continuous_config = (continuous_retention_hours > 0).then(|| recorder::ContinuousConfig {
+        dir: continuous_dir.to_path_buf(),
+        segment_minutes: continuous_segment_minutes,
+        retention_hours: continuous_retention_hours,
+    });
+
+    let recording = recorder::start_all(&channels, buffer_dir, retention, continuous_config, filename_tz).await?;
 
     println!("keeping local clips for {local_retention_days}d (0 = forever)");
-    recorder::start_local_retention_sweep(clips_dir.to_path_buf(), local_retention_days);
+    recorder::start_local_retention_sweep(clips_dir.to_path_buf(), "mp4", local_retention_days, filename_tz);
+    recorder::start_local_retention_sweep(snapshots_dir.to_path_buf(), "jpg", local_retention_days, filename_tz);
+
+    let snapshot_config = Arc::new(imou_vision::SnapshotConfig {
+        max_count: snapshot_count,
+        ..Default::default()
+    });
 
     let gdrive_client = gdrive::config_from_env().map(|cfg| Arc::new(gdrive::GDriveClient::new(cfg)));
     match &gdrive_client {
@@ -158,6 +178,17 @@ pub async fn run(
         ),
         None => println!(
             "MQTT publish not configured (MQTT_BROKER_HOST/MQTT_BROKER_PORT not set) — motion events are not published"
+        ),
+    }
+
+    let vision_client =
+        imou_vision::config_from_env().map(|cfg| Arc::new(imou_vision::VisionClient::new(cfg)));
+    match &vision_client {
+        Some(_) => println!(
+            "analyzing motion clips via Ollama (gate gdrive upload: {ai_gate_gdrive_upload}, gate mqtt analyzed: {ai_gate_mqtt_analyzed})"
+        ),
+        None => println!(
+            "AI analysis not configured (AI_OLLAMA_URL/AI_MODEL_NAME not set) — clips are logged/uploaded as before"
         ),
     }
 
@@ -204,10 +235,18 @@ pub async fn run(
                                 channel_name.clone(),
                                 buffer_dir.to_path_buf(),
                                 clips_dir.to_path_buf(),
+                                snapshots_dir.to_path_buf(),
+                                snapshot_config.clone(),
                                 alarm,
                                 pre_roll,
                                 post_roll,
                                 gdrive_client.clone(),
+                                mqtt_client.clone(),
+                                event_log.clone(),
+                                vision_client.clone(),
+                                ai_gate_gdrive_upload,
+                                ai_gate_mqtt_analyzed,
+                                filename_tz,
                             );
                         }
                     }

@@ -8,6 +8,22 @@ A Rust CLI (`imou-cli`) for controlling Imou/Dahua Easy4ip cameras through the
 Imou Open Platform HTTP API. Credentials live in `.env` (gitignored) and are
 loaded at startup with `dotenvy`.
 
+**This repo is public — before every commit, check every changed/new file
+for personal or account-specific information**, not just secrets in the
+obvious `.env`-shaped sense. This has actually slipped in before: doc
+comments and `CLAUDE.md` notes written while narrating real verification
+work ended up describing the real content of a real user's camera footage
+(e.g. what specifically was seen walking through frame) — technically not
+a credential, but not something that belongs in a public repo either.
+Also watch for real IPs/hostnames/domains, device IDs, and RTSP
+passwords — this project's own history shows these leak easily into
+"verified live against the real thing" narration, precisely because that
+kind of verification is this project's normal working style. When
+documenting a live-verification finding, describe the mechanism and the
+result in the abstract ("a real motion event," "the correct frame was
+picked"), not the specific real-world content that happened to be in
+frame.
+
 Reference docs (fetch these when adding new endpoints — the site has no
 sitemap, so guess method-doc paths from the pattern
 `device/<category>/<method>.html` under `http/`, e.g.
@@ -419,6 +435,367 @@ rule as `ImouClient::new`'s 20s `reqwest` timeout and `GDriveClient::new`'s
 180s one, applied here because this codebase has a documented incident
 where a network call with no timeout silently hung a long-lived loop
 forever with no crash and no error to signal it.
+
+## AI video-content analysis (`crates/imou-vision`)
+
+Both `watch` and `listen` optionally classify each extracted clip's content
+(human/animal/vehicle/package/empty) and get a free-text description from a
+**local** vision-language model served by Ollama, then use that to enrich
+the event log/MQTT stream and, opt-in, gate the existing Google Drive
+upload / MQTT publish. Same "opt-in, no-op if unconfigured" convention as
+`gdrive`/`mqtt`: `imou_vision::config_from_env()` returns `None` unless
+`AI_OLLAMA_URL`/`AI_MODEL_NAME` are both set, and behavior is unchanged
+from before this feature existed if they aren't.
+
+**Why a separate workspace crate, not another `src/` module**: the repo's
+root `Cargo.toml` is now both a package manifest and a workspace root
+(`[package]` + `[workspace] members = ["crates/imou-vision"]` in the same
+file — Cargo supports this directly, avoiding a `src/` move and the
+resulting churn to every existing `use crate::...` path). `imou-vision`
+depends on nothing from `imou-cli` and could be reused standalone; the
+dependency only runs one direction (`imou-cli` depends on `imou-vision`,
+declared as a normal path dependency in the root `[dependencies]`).
+Internally the crate is split into `reqwest`-free modules (`response.rs`
+parsing, `relevance.rs`, `frames.rs`'s timestamp math) plus the actual
+HTTP-calling `client.rs`, so most of it is unit-testable without a live
+Ollama instance — same precedent as `listen::tests` verifying timestamp
+parsing against a captured real payload with no live API needed.
+
+**Frame extraction happens inside `imou-vision`, not `recorder.rs`**:
+`ffmpeg`/`ffprobe` are already a hard runtime dependency of the Docker
+image (installed for the ring-buffer/clip-concat code), so `imou_vision::
+extract_frames` invokes them directly via `tokio::process::Command`, same
+idiom as `recorder.rs`. `imou_vision::analyze_clip` (the crate's main
+entry point) probes the clip's duration, picks 1–3 evenly-spaced
+timestamps via `frames::pick_timestamps` (pure function, falls back to the
+clip's midpoint for very short clips), extracts one JPEG per timestamp
+into a per-call scratch dir under `std::env::temp_dir()`, reads them, and
+POSTs them (base64-encoded) to Ollama's `/api/generate` with `format:
+"json"` and a fixed prompt asking for `{"category": ..., "description":
+...}`. The scratch dir is removed (best-effort) on both the success and
+error path — callers own no cleanup.
+
+**Non-obvious Ollama gotcha, worth remembering**: the outer response's
+`response` field holds the model's structured output as a JSON-encoded
+**string**, not a nested JSON object — `response.rs`'s
+`parse_generate_response` is therefore a genuine double-decode (outer
+envelope, then the inner string), tested explicitly against a response
+captured from a real `ollama run moondream` call.
+
+**`format` must be a JSON Schema, not the bare string `"json"` — verified
+live, this one actually broke output correctness, not just parsing
+elegance**: `client.rs::response_schema` sends a JSON Schema object as
+`format` (Ollama's "structured outputs" feature, a grammar constraint
+applied at decode time regardless of model). The bare string `format:
+"json"` ("produce some valid JSON, shape unconstrained") was tried first
+and failed live: `moondream` reliably degenerated into repeating a garbage
+key (`"distance_elapsed"`) hundreds of times until it hit its generation
+limit, ~31 seconds later, leaving the inner `response` string genuinely
+**unterminated** (an open string, no closing brace) despite starting with
+a perfectly good `category`/`description` — not just verbose, actually
+invalid JSON that fails to parse at all. Passing the schema instead
+constrains generation to exactly the two fields being asked for, so the
+object closes as soon as they're filled: same model, same test image,
+under 1 second, clean `done_reason: "stop"`. `response.rs` still degrades
+gracefully (falls back to `Category::Unknown`, raw text kept as the
+description) if a differently-behaving model or a future Ollama version
+ever produces a malformed body again — that fallback is a safety net for
+a failure mode this project has directly observed, not a hypothetical.
+
+**Relevance is computed locally, not asserted by the model**:
+`relevance::is_relevant` maps `Category` -> `bool` in Rust
+(`Empty`/`Unknown` are not relevant, everything else is) rather than
+asking the model to also judge relevance itself — a local
+vision-language model's judgment of "what is this" is far more reliable
+than its judgment of "is this worth caring about", and a fixed mapping is
+easy to reason about/adjust later. A model response that isn't valid JSON,
+or names a category outside the fixed set, degrades to `Category::Unknown`
+with the raw text kept as the description — analysis quality degrades
+gracefully, it must never error out and block the clip pipeline.
+
+**Integration into the existing pipeline — the MQTT/log timing tension**:
+today, per alarm, the immediate `MotionEvent` log line and `.../motion`
+MQTT publish both fire *before* clip extraction even starts (extraction
+has to wait for the post-roll window to land on disk); AI analysis can
+only run once the clip exists, so gating the fast notification path on it
+would add real, unacceptable latency to every motion alert. Instead, AI
+analysis is a **second, deferred, additive** event:
+`motion_event::MotionAnalysisEvent` (`kind: "motion_analyzed"`, correlated
+to the original line by `alarm_id`) is appended to the *same*
+`motion_events.jsonl` via the existing `EventLog::append`, and (if MQTT is
+configured) published to a *second* topic, `{prefix}/<channel_name>/
+motion-analyzed`, via `MqttPublisher::publish_analysis`. Both happen
+inside `recorder::spawn_clip_extraction`'s `Ok(out_path)` arm, after
+`extract_clip` succeeds and (if `vision` is configured)
+`imou_vision::analyze_clip` runs.
+
+**Gating is fail-open and opt-in**: `spawn_clip_extraction` gained
+`ai_gate_gdrive_upload`/`ai_gate_mqtt_analyzed` bool parameters
+(`--ai-gate-gdrive-upload`/`--ai-gate-mqtt-analyzed` CLI flags on
+`watch`/`listen`, both default `false`). An AI call that errors, times
+out, or isn't configured at all never suppresses the existing Drive
+upload / MQTT publish — only a confident, successfully-parsed `relevant ==
+false` verdict does, and only when the corresponding flag is explicitly
+set. The local `.mp4` itself is **never** gated on the AI verdict — it
+always stays on disk regardless, same "local retention is independent of
+upload outcome" philosophy as the Drive-upload section above.
+`Alarm.label_type` (Imou's own on-device classification) is deliberately
+*not* used to skip the AI call — it's documented elsewhere in this file as
+undocumented/unreliable, and using it to suppress inference would risk
+silently dropping real events on exactly the accounts where it's wrong.
+
+**Runtime**: Ollama runs as its own sidecar Docker container
+(`imou-ollama` in `deploy/docker-compose.yaml`), not embedded in the
+`imou-cli` process — keeps the `imou-cli` image free of
+ONNX/CUDA-class dependencies, and `imou-vision` just speaks plain HTTP to
+it (`reqwest`, explicit timeout, same rule as every other network client
+in this codebase — see the MQTT section above for why that timeout is
+never optional). Default model: `moondream` (1.8B, CPU-friendly, fits a
+home-server/small-VPS deployment target); `AI_MODEL_NAME=llava` is a
+documented heavier opt-in for a GPU host. Model weights are pulled once
+(`ollama pull <model>`) into a bind-mounted volume so they survive
+container recreates — see `deploy/README.md`.
+
+**Verified live on the real production homeserver: not viable on that
+specific hardware, currently disabled there.** Even `moondream` (the
+smallest capable model) pegged all 4 cores of that host's Intel Apollo
+Lake CPU (no GPU) at 300%+ for multiple minutes per single-image call —
+observed still running past 400s in one test — on a box that also runs
+unrelated production services (other projects' backends/databases) with
+under 300MB of free RAM to begin with. `AI_OLLAMA_URL`/`AI_MODEL_NAME` are
+commented out in that deployment's `.env` and the `imou-ollama` container
+was removed; the code path itself is untouched and fail-open, so it's a
+one-line `.env` change (plus redeploying an `imou-ollama` service) to
+re-enable on a host that can actually carry it — but don't assume a
+"small" local VLM is automatically cheap enough for whatever box `watch`/
+`listen` happen to be running on; verify like this was verified. See
+`snapshot` below for what replaced it on that deployment.
+
+## Frame-diff snapshot extraction (`imou-vision::snapshot`)
+
+Both `watch` and `listen` always (no config/opt-in — see below) extract a
+representative JPEG snapshot per motion clip using pixel-level frame
+differencing via ffmpeg — the practical replacement for the Ollama path
+above on hardware too weak to run even a small VLM, born directly from
+that finding.
+
+**Algorithm** (`crates/imou-vision/src/snapshot.rs::extract_snapshots`): a
+single ffmpeg analysis pass —
+```
+select='not(mod(n\,DECIMATE))',tblend=all_mode=difference,signalstats,metadata=print:file=<tmp>
+```
+`tblend=all_mode=difference` outputs the per-pixel `|frame_n - frame_n-1|`
+image; `signalstats`' `YAVG` on that is the average magnitude of that
+difference — a direct, continuous motion score, 0 for identical
+consecutive frames. `select='not(mod(n,DECIMATE))'` (default `DECIMATE=4`)
+compares every 4th frame instead of every consecutive one — verified live
+this cuts analysis time roughly 4x (31s → 8s on a real ~97s clip) with no
+loss of detection, since real motion spans many frames regardless. The
+metadata is written to a temp file (`file=...`), not stdout — avoids
+fighting with `-f null -`'s own output on the same stream, same pattern as
+`recorder::extract_clip`'s temp concat-list file. `parse_diff_scores`
+(pure function) parses `(pts_time, YAVG)` pairs from it;
+`select_top_timestamps` (pure function) greedily picks the `max_count`
+(default 1) highest-scoring timestamps at least `min_gap_secs` (default
+2.0) apart, then one `ffmpeg -ss <t> -frames:v 1` call per pick (the same
+single-frame-extraction helper `frames.rs` uses for the Ollama path,
+factored out as `extract_frame_at` and shared by both).
+
+**Rejected first attempt, worth remembering**: ffmpeg's `select=gt(scene,X)`
+— a hard scene-CUT detector built for edited video, the obvious-looking
+first choice — was tried first and verified live to be unusable for CCTV
+motion: on one real clip its score never exceeded its own ~0.06-0.08 noise
+floor (never a real spike, just compression noise), and on a second real
+clip it scored exactly 0 for the ENTIRE clip despite real motion partway
+through. There's no threshold that fixes this — it's the wrong metric for
+gradual real-world motion, not a tuning problem. The `tblend=difference` +
+`signalstats` approach used instead is a literal per-pixel motion
+magnitude, and correctly picked out that same moment on the second clip
+(confirmed by eye against the extracted JPEG, score roughly 3x the
+surrounding baseline) — this is why `SnapshotConfig`
+has no threshold field: every clip has *some* highest-scoring frame, and
+that's always the one taken, regardless of its absolute value.
+
+**Always on, unlike `gdrive`/`mqtt`/`vision`**: no `config_from_env`, no
+env var gate. It's local pixel arithmetic against a file already on disk —
+no network call, no credential, no external service — so there's nothing
+to be "not configured." `--snapshots-dir` (default `snapshots`) and
+`--snapshot-count` (default `1`) are the only knobs, same style as
+`--clips-dir`. Filenames match `extract_clip`'s own convention exactly
+(`<local-time>_<alarm_id>[_n].jpg` under
+`<snapshots_dir>/<channel_name>/`), so a clip and its snapshot(s) are
+trivially correlated and `recorder::start_local_retention_sweep`
+(generalized to take a file extension parameter — `"mp4"` for clips,
+`"jpg"` for snapshots, same `--local-retention-days`) sweeps both trees
+with the exact same filename parser.
+
+**Wired into `recorder::spawn_clip_extraction` unconditionally**, right
+alongside (not gated by) the AI analysis block — a snapshot failure only
+logs a warning, same fail-open posture as everything else in that
+function; it never affects clip extraction, upload, or AI analysis.
+
+Verified live end-to-end on a real homeserver clip with real motion in it
+(downloaded via the `/mnt/wd/imou-video` share, analyzed with a
+`rust:1-slim-bookworm` + `ffmpeg` container matching the production build
+image exactly, to avoid a glibc/codec mismatch with this dev machine's own
+Fedora `ffmpeg-free` package, which lacks HEVC decode entirely — these
+cameras' clips are H.265): the snapshot picked out the moment something
+actually entered frame, correctly ranked above two other picks from the
+same clip that were genuinely uneventful (an empty scene) — confirmed by
+eye, not just by the score numbers.
+
+## Continuous recording (`src/recorder.rs`)
+
+Both `watch` and `listen` can optionally record the **entire** video
+stream (not just motion pre/post-roll) for every channel with local RTSP
+config, into a rolling window — e.g. "keep the last 2 days." Opt-in via
+`--continuous-retention-hours` (default `0`): **unlike every other
+`--*-retention-*` flag in this CLI, `0` here means the feature is off, not
+"keep forever"** — continuous recording is the one feature costly enough
+(tens of GB per camera per day) to need an explicit opt-in via its own
+retention value rather than being always-on with just the sweep
+disableable. `--continuous-dir` (default `continuous`) and
+`--continuous-segment-minutes` (default `15`) are the other two knobs.
+
+**One ffmpeg process per camera, two independent segment outputs** — not
+two separate RTSP connections. `build_recorder_args`
+(`src/recorder.rs`, pure function, unit-tested against the exact command
+verified live) adds a second, independent `-c copy -f segment` branch to
+the same ffmpeg invocation that already writes the short-lived `.ts`
+pre-roll ring buffer:
+```
+ffmpeg -i rtsp://... -c copy \
+  -f segment -segment_time 2    -strftime 1 -reset_timestamps 1 <buffer>/seg_%Y%m%dT%H%M%S.ts \
+  -c copy -f segment -segment_time <secs> -strftime 1 -reset_timestamps 1 <continuous>/seg_%Y%m%dT%H%M%S.mp4
+```
+Verified live (synthetic real-time-paced source, `-re`) that ffmpeg
+accepts two independent `segment` muxers — different `segment_time`,
+different container format — from one input in a single process. Reusing
+the connection this way, rather than opening a second RTSP session to the
+same camera, was a deliberate choice: how many concurrent RTSP sessions
+these cameras tolerate has never been tested, so avoiding the question
+entirely is the safer default. Both outputs are `-c copy` (no re-encode),
+so the CPU cost of the second branch is negligible — same reasoning
+already documented above for the ring buffer itself.
+
+**Format is `.mp4`, not `.ts`, unlike the ring buffer** — the ring buffer
+is only ever consumed internally (concatenated into a clip), but the
+continuous archive is meant to be opened directly by a person. The
+`segment` muxer finalizes each file (writes its `moov` atom) when it
+rotates to the next one, so every *completed* segment is a normal, fully
+playable file. **The currently-recording segment is the one real caveat**:
+it has no `moov` atom yet, so a player can fail to open it or report a
+wrong duration/seek range until it rotates — not a corruption risk, just
+an mp4-format-with-a-segment-muxer limitation, worth knowing before
+assuming "the newest file won't open" means something is broken. This is
+also why the default segment length is 15 minutes, not something larger
+like an hour: it bounds how stale "the most recent watchable footage" can
+be.
+
+**Naming and retention reuse the ring buffer's own machinery** — same
+`seg_<YYYYmmddTHHMMSS>.<ext>` convention, so `parse_segment_time` and the
+now-generalized `cleanup_old_segments` (extension is a parameter — `"ts"`
+for the ring buffer, `"mp4"` for the continuous archive; same refactor
+pattern already applied once to the snapshot feature's
+`sweep_local_clips`→`sweep_local_files`) are shared verbatim, just pointed
+at a different directory/extension/retention window. `start_ring_buffer`
+spawns a third cleanup task (alongside the recorder and the existing
+ring-buffer sweep) only when continuous recording is configured.
+
+**No per-day subfolders** — considered and rejected: ffmpeg's `segment`
+muxer does not create missing directories on the fly, so a pattern like
+`continuous/%Y-%m-%d/seg_%H%M%S.mp4` would silently break at every
+midnight rollover (the new day's directory doesn't exist yet). A flat
+per-channel directory, sortable by filename, avoids this entirely — same
+layout already used for the ring buffer and for clips.
+
+**Intended viewing path is the existing network share, not a new UI**:
+`/mnt/wd` on the homeserver is already reachable as a network share from
+the user's own machines (confirmed live this session — mounted locally at
+`/mnt/wd_share`), so pointing `--continuous-dir` there means completed
+segments are directly double-clickable from a normal file browser or VLC,
+no additional web UI needed. Completed segments are safe to read
+concurrently with ffmpeg writing the *next* one — no locking concern,
+since it's a plain sequential write to a different, already-closed file;
+the only real limitation is the in-progress-segment one described above,
+which is inherent to the file format, not the filesystem or network
+share.
+
+**A second, related caveat found live, not just theoretical**: a
+container restart/redeploy *while a continuous segment is mid-write*
+leaves that specific segment permanently corrupt — `kill_on_drop` kills
+ffmpeg mid-write (same as any other restart, e.g. an auto-restart after a
+stalled RTSP connection), so that file never gets its `moov` atom and the
+new ffmpeg process that starts afterward begins an entirely new segment
+file rather than resuming the old one. Confirmed live: redeploying to add
+the `TZ` fix (see below) killed a segment ~9 minutes into its 15-minute
+window, permanently unplayable, while the segment before it (which
+reached a full natural rotation first) played back fine at the expected
+~900s duration. No fix applied for this — same "no partial-clip handling
+on exit, documented as intentional" posture already accepted for
+motion-triggered clip extraction — but worth knowing before assuming a
+broken file means the recording pipeline itself is broken: check whether
+a restart happened to land in that segment's window first.
+
+## Filename timezone (`--filename-timezone`, `src/recorder.rs`)
+
+**Real bug found live, root cause was container configuration, not
+application logic**: filenames (ring buffer/continuous segments, clips,
+snapshots) were observed on the production homeserver showing UTC instead
+of the account's real local time, even though the code was already
+written to use local time everywhere in filenames (`chrono::Local` in
+Rust, ffmpeg's `-strftime 1` which uses the *process's* clock). Root
+cause: `docker exec imou-cli date` showed UTC while the host itself was
+CEST — the container simply had no `TZ`/`/etc/localtime` configured (a
+bare Docker container defaults to UTC), so "local" was accidentally UTC
+by omission. Fixed independently of the feature below by setting `TZ` in
+`.env` (see `.env.example`, `deploy/.env.production.example`) — the
+runtime image already has `tzdata` installed as a transitive dependency
+(confirmed live), so no `Dockerfile` change was needed, just the env var.
+
+On top of that fix, `--filename-timezone <utc|local>` (default `local`)
+lets this be an explicit choice rather than only "whatever the container's
+`TZ` happens to be." Scope is deliberately narrow — **filenames only**:
+- Ring buffer/continuous archive segments (ffmpeg `-strftime`), clip and
+  snapshot filenames (`extract_clip`, `spawn_clip_extraction`'s snapshot
+  `file_prefix`), and the retention sweeps that later parse those same
+  names back (`cleanup_old_segments`, `sweep_local_files`) — the sweep's
+  cutoff computation MUST use the same convention the names were written
+  in, or it compares against the wrong "now" and evicts at the wrong
+  time; both go through the same `FilenameTimezone` value for exactly
+  this reason.
+- **Deliberately excluded**: `MotionEvent`/`MotionAnalysisEvent`'s
+  `time`/`local_time` fields in the JSON event log (already a
+  well-defined, always-UTC/always-local pair — unrelated to filenames);
+  `watch.rs`'s polling windows (`ChannelCursor`, tied to
+  `getAlarmMessage`'s own local-as-if-UTC filtering behavior documented
+  above in Architecture, not a display preference — changing this would
+  break the actual API filter); the Google Drive day-folder grouping
+  (`spawn_clip_extraction`'s `alarm_local_time(&alarm).date_naive()`,
+  kept as the real local calendar day always, regardless of this flag —
+  "which day did this happen" is a different question from "how is the
+  filename formatted").
+
+**Mechanism, two different techniques for two different clocks**:
+- ffmpeg's `-strftime` uses the *child process's* clock, not something
+  passed as a CLI arg — `run_recorder_supervisor` sets `TZ=UTC` on the
+  spawned ffmpeg's environment only for `FilenameTimezone::Utc`
+  (`ffmpeg_tz_env`, a pure function so this is unit-tested without
+  spawning ffmpeg); for `Local` it sets nothing and inherits the
+  container's own `TZ` (which is why the fix above matters independent of
+  this flag — `local` mode still depends on it being correct). This
+  avoids ever needing to know/hardcode the real IANA zone name for "local"
+  mode.
+- Rust-side filenames go through two small helpers,
+  `alarm_filename_time`/`now_naive`, which resolve straight to
+  `NaiveDateTime` once the convention is chosen — replacing what used to
+  be a single hardcoded `alarm_local_time`/`Local::now()` call each.
+  `extract_clip` previously used `alarm_local_time` for two things at
+  once: matching the pre/post-roll window against ring-buffer segment
+  filenames, and building the clip's own output filename — both had to
+  move to the mode-aware helper together, since the window-matching side
+  must stay consistent with whatever convention the segments were
+  actually named in, not just the final filename.
 
 ## Production deployment
 

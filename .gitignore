@@ -5,4 +5,6 @@
 motion_events.jsonl
 .imou_ring_buffer/
 clips/
+snapshots/
+continuous/
 .claude/

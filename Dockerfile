@@ -5,14 +5,20 @@
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /app
 
-# Cache dependency compilation separately from source changes.
+# Cache dependency compilation separately from source changes. Workspace
+# member `imou-vision` needs its own Cargo.toml present before `cargo build`
+# will resolve the graph, so it gets the same dummy-source treatment.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs \
-    && cargo build --release \
-    && rm -rf src
+COPY crates/imou-vision/Cargo.toml crates/imou-vision/Cargo.toml
+RUN mkdir -p src crates/imou-vision/src \
+    && echo 'fn main() {}' > src/main.rs \
+    && echo '// dummy for dependency caching' > crates/imou-vision/src/lib.rs \
+    && cargo build --release --bin imou-cli \
+    && rm -rf src crates/imou-vision/src
 
 COPY src ./src
-RUN touch src/main.rs && cargo build --release
+COPY crates/imou-vision/src ./crates/imou-vision/src
+RUN touch src/main.rs crates/imou-vision/src/lib.rs && cargo build --release --bin imou-cli
 
 FROM debian:bookworm-slim
 RUN apt-get update \

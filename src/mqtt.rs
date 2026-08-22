@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use rumqttc::{AsyncClient, MqttOptions, QoS, Transport};
 
-use crate::motion_event::MotionEvent;
+use crate::motion_event::{MotionAnalysisEvent, MotionEvent};
 
 /// Broker connection details plus the topic-naming convention (one topic
 /// per camera: `{topic_prefix}/<channel_name>/motion`). Presence of
@@ -114,6 +114,19 @@ impl MqttPublisher {
     /// loop" failure class this project already hit once with `reqwest`.
     pub fn publish(&self, event: &MotionEvent, channel_name: &str) {
         let topic = format!("{}/{}/motion", self.topic_prefix, channel_name);
+        self.publish_to(topic, event);
+    }
+
+    /// Same fire-and-forget posture as `publish`, on a separate topic since
+    /// this fires later — once AI analysis of the extracted clip completes
+    /// (see `MotionAnalysisEvent`'s doc note on why it's a deferred, second
+    /// event rather than folded into the immediate `motion` publish).
+    pub fn publish_analysis(&self, event: &MotionAnalysisEvent, channel_name: &str) {
+        let topic = format!("{}/{}/motion-analyzed", self.topic_prefix, channel_name);
+        self.publish_to(topic, event);
+    }
+
+    fn publish_to(&self, topic: String, event: &impl serde::Serialize) {
         let payload = match serde_json::to_vec(event) {
             Ok(p) => p,
             Err(e) => {

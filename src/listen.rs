@@ -79,10 +79,16 @@ struct AppState {
     device_channel_names: Arc<HashMap<String, String>>,
     buffer_dir: Arc<PathBuf>,
     clips_dir: Arc<PathBuf>,
+    snapshots_dir: Arc<PathBuf>,
+    snapshot_config: Arc<imou_vision::SnapshotConfig>,
     pre_roll: Duration,
     post_roll: Duration,
     gdrive: Option<Arc<gdrive::GDriveClient>>,
     mqtt: Option<Arc<mqtt::MqttPublisher>>,
+    vision: Option<Arc<imou_vision::VisionClient>>,
+    ai_gate_gdrive_upload: bool,
+    ai_gate_mqtt_analyzed: bool,
+    filename_tz: recorder::FilenameTimezone,
 }
 
 /// Handles one push delivery. Always returns 200 — per push.html, Imou
@@ -158,10 +164,18 @@ async fn callback_handler(State(state): State<AppState>, body: Bytes) -> StatusC
             channel_name,
             (*state.buffer_dir).clone(),
             (*state.clips_dir).clone(),
+            (*state.snapshots_dir).clone(),
+            state.snapshot_config.clone(),
             alarm,
             state.pre_roll,
             state.post_roll,
             state.gdrive.clone(),
+            state.mqtt.clone(),
+            state.event_log.clone(),
+            state.vision.clone(),
+            state.ai_gate_gdrive_upload,
+            state.ai_gate_mqtt_analyzed,
+            state.filename_tz,
         );
     }
 
@@ -181,11 +195,19 @@ pub async fn run(
     events_file: &Path,
     buffer_dir: &Path,
     clips_dir: &Path,
+    snapshots_dir: &Path,
+    snapshot_count: u8,
+    continuous_dir: &Path,
+    continuous_segment_minutes: u32,
+    continuous_retention_hours: u32,
     pre_roll: Duration,
     post_roll: Duration,
     max_push_latency: Duration,
     gdrive_retention_days: u32,
     local_retention_days: u32,
+    ai_gate_gdrive_upload: bool,
+    ai_gate_mqtt_analyzed: bool,
+    filename_tz: recorder::FilenameTimezone,
 ) -> Result<()> {
     let event_log = Arc::new(EventLog::open(events_file)?);
 
@@ -210,10 +232,22 @@ pub async fn run(
     // (default generous: a cold registration was observed live to take
     // ~48 minutes before its first real delivery).
     let retention = pre_roll + max_push_latency + RETENTION_MARGIN;
-    let recording = recorder::start_all(&channels, buffer_dir, retention).await?;
+    let continuous_config = (continuous_retention_hours > 0).then(|| recorder::ContinuousConfig {
+        dir: continuous_dir.to_path_buf(),
+        segment_minutes: continuous_segment_minutes,
+        retention_hours: continuous_retention_hours,
+    });
+
+    let recording = recorder::start_all(&channels, buffer_dir, retention, continuous_config, filename_tz).await?;
 
     println!("keeping local clips for {local_retention_days}d (0 = forever)");
-    recorder::start_local_retention_sweep(clips_dir.to_path_buf(), local_retention_days);
+    recorder::start_local_retention_sweep(clips_dir.to_path_buf(), "mp4", local_retention_days, filename_tz);
+    recorder::start_local_retention_sweep(snapshots_dir.to_path_buf(), "jpg", local_retention_days, filename_tz);
+
+    let snapshot_config = Arc::new(imou_vision::SnapshotConfig {
+        max_count: snapshot_count,
+        ..Default::default()
+    });
 
     let gdrive_client = gdrive::config_from_env().map(|cfg| Arc::new(gdrive::GDriveClient::new(cfg)));
     match &gdrive_client {
@@ -237,6 +271,17 @@ pub async fn run(
         ),
     }
 
+    let vision_client =
+        imou_vision::config_from_env().map(|cfg| Arc::new(imou_vision::VisionClient::new(cfg)));
+    match &vision_client {
+        Some(_) => println!(
+            "analyzing motion clips via Ollama (gate gdrive upload: {ai_gate_gdrive_upload}, gate mqtt analyzed: {ai_gate_mqtt_analyzed})"
+        ),
+        None => println!(
+            "AI analysis not configured (AI_OLLAMA_URL/AI_MODEL_NAME not set) — clips are logged/uploaded as before"
+        ),
+    }
+
     let state = AppState {
         app_id: Arc::from(client.app_id()),
         event_log,
@@ -244,10 +289,16 @@ pub async fn run(
         device_channel_names: Arc::new(device_channel_names),
         buffer_dir: Arc::new(buffer_dir.to_path_buf()),
         clips_dir: Arc::new(clips_dir.to_path_buf()),
+        snapshots_dir: Arc::new(snapshots_dir.to_path_buf()),
+        snapshot_config,
         pre_roll,
         post_roll,
         gdrive: gdrive_client,
         mqtt: mqtt_client,
+        vision: vision_client,
+        ai_gate_gdrive_upload,
+        ai_gate_mqtt_analyzed,
+        filename_tz,
     };
 
     let app = Router::new()

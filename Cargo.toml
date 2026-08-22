@@ -3,12 +3,16 @@ name = "imou-cli"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["crates/imou-vision"]
+
 [dependencies]
 anyhow = "1.0.104"
 axum = "0.8.9"
 chrono = "0.4.45"
 clap = { version = "4.6.6", features = ["derive"] }
 dotenvy = "0.15.7"
+imou-vision = { path = "crates/imou-vision" }
 md-5 = "0.11.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "form", "query", "rustls"] }
 rumqttc = "0.25.1"
