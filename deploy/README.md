@@ -93,8 +93,10 @@ before deploying:
    callback registration itself is untouched by this, since `listen` never
    calls `setMessageCallback`.
 6. If Google Drive upload is configured: after step 4's real motion event,
-   confirm the clip also appears in the target Drive folder, and that
-   `~/imou-cli/data/clips/<channel>/...mp4` is gone afterward (deleted only
-   on a successful upload — see CLAUDE.md). A `docker compose up -d
-   --force-recreate` afterward should not require re-running
+   confirm the clip also appears in the target Drive folder. Unlike
+   earlier versions, the local `~/imou-cli/data/clips/<channel>/...mp4`
+   copy is *not* deleted on a successful upload — local and Drive copies
+   now age out independently via `--local-retention-days` and
+   `--gdrive-retention-days` respectively (see CLAUDE.md). A `docker
+   compose up -d --force-recreate` afterward should not require re-running
    `gdrive-login`, confirming the token cache bind mount actually persists.

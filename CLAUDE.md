@@ -256,22 +256,35 @@ needed, unlike most other verification in this project.
 ## Google Drive clip upload (`src/gdrive/`)
 
 Both `watch` and `listen` optionally upload each extracted clip to Google
-Drive right after a successful local save, deleting the local `.mp4` only
-if the upload succeeds — the local copy stays as the fallback on any
-upload failure (network down, bad token, etc.), matching this project's
-general "detection/recording must never depend on a remote call
-succeeding" posture. `recorder::extract_clip` now returns the written
-`PathBuf` (previously `Result<()>`) so `recorder::spawn_clip_extraction`
-has something to hand to `gdrive::upload_and_replace`; the upload itself
-runs inside the same detached per-alarm task extraction already used
-(fire-and-forget, errors only `eprintln!`'d — see the ring-buffer section
-above), so a slow or failed upload never blocks `watch`'s poll loop or
-`listen`'s push HTTP handler. The feature is entirely opt-in: if
-`gdrive::config_from_env()` returns `None` (no `GDRIVE_CLIENT_ID`/
-`GDRIVE_CLIENT_SECRET` in the environment), `watch`/`listen` pass `None`
-through to every `spawn_clip_extraction` call and behavior is byte-for-byte
-identical to before this feature existed — same "no-op if unconfigured"
-convention as `recorder::local_config_for` for per-camera RTSP recording.
+Drive right after a successful local save. `recorder::extract_clip` now
+returns the written `PathBuf` (previously `Result<()>`) so
+`recorder::spawn_clip_extraction` has something to hand to
+`gdrive::upload_clip`; the upload itself runs inside the same detached
+per-alarm task extraction already used (fire-and-forget, errors only
+`eprintln!`'d — see the ring-buffer section above), so a slow or failed
+upload never blocks `watch`'s poll loop or `listen`'s push HTTP handler.
+The feature is entirely opt-in: if `gdrive::config_from_env()` returns
+`None` (no `GDRIVE_CLIENT_ID`/`GDRIVE_CLIENT_SECRET` in the environment),
+`watch`/`listen` pass `None` through to every `spawn_clip_extraction` call
+and behavior is byte-for-byte identical to before this feature existed —
+same "no-op if unconfigured" convention as `recorder::local_config_for`
+for per-camera RTSP recording.
+
+**Local and Drive copies have independent retention, not a fallback
+relationship.** Earlier versions deleted the local `.mp4` as soon as its
+Drive upload succeeded (keeping it only as a fallback on upload failure).
+`gdrive::upload_clip` no longer touches the local file either way — a
+successful upload and the local file's deletion are now fully decoupled.
+Instead, `recorder::start_local_retention_sweep` (`--local-retention-days`,
+default 30, `0` = keep forever) periodically deletes `clips_dir` entries
+older than its window, on the same "detached task, no shutdown signal
+needed" reasoning as `gdrive::retention::start_retention_sweep` below,
+parsing the `<YYYYmmddTHHMMSS>_<alarm_id>.mp4` filename the same way
+`parse_segment_time` reads ring-buffer segment names. This exists because
+a deployment may reasonably want a longer/shorter local retention window
+than its Drive retention window (e.g. cheap local disk kept for a month,
+Drive storage trimmed to a few days) — the two flags are set independently
+per deployment, in `deploy/docker-compose.yaml`'s `command` block.
 
 **A plain service account does not work here — verified live, not assumed
 from docs.** The first implementation attempt used a Google service

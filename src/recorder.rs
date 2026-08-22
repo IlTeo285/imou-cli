@@ -28,6 +28,7 @@ const RESTART_BACKOFF: StdDuration = StdDuration::from_secs(5);
 /// documented in CLAUDE.md for the `watch` poll loop.
 const RTSP_READ_TIMEOUT_USECS: u64 = 15_000_000;
 const CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(5);
+const LOCAL_RETENTION_SWEEP_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 /// Extra time to wait past a segment's nominal start before trusting it
 /// covers that instant, and past a clip window's end before assuming
 /// ffmpeg has flushed the segment that covers it to disk.
@@ -157,10 +158,11 @@ pub async fn shutdown_all(setup: RecordingSetup) {
 /// Spawns `extract_clip` as a detached task — used by both `watch` and
 /// `listen` so a slow clip extraction never blocks their respective
 /// detection loops (polling / the push HTTP handler). If `gdrive` is
-/// configured, a successfully extracted clip is also uploaded and the
-/// local file removed on success — same fire-and-forget/log-only error
-/// handling as extraction itself, and the same "no-op if unconfigured"
-/// convention as `local_config_for`.
+/// configured, a successfully extracted clip is also uploaded — same
+/// fire-and-forget/log-only error handling as extraction itself, and the
+/// same "no-op if unconfigured" convention as `local_config_for`. The local
+/// file is left untouched either way: its lifetime is governed independently
+/// by `start_local_retention_sweep`, not by upload success.
 pub fn spawn_clip_extraction(
     channel_name: String,
     buffer_dir: PathBuf,
@@ -176,7 +178,7 @@ pub fn spawn_clip_extraction(
                 if let Some(client) = gdrive {
                     let date = alarm_local_time(&alarm).map(|dt| dt.date_naive());
                     let upload_result = match date {
-                        Ok(date) => gdrive::upload_and_replace(&client, &out_path, &channel_name, date).await,
+                        Ok(date) => gdrive::upload_clip(&client, &out_path, &channel_name, date).await,
                         Err(e) => Err(e),
                     };
                     if let Err(e) = upload_result {
@@ -361,6 +363,68 @@ async fn cleanup_old_segments(dir: &Path, retention: StdDuration) -> Result<()> 
         }
     }
     Ok(())
+}
+
+/// Parses the `<YYYYmmddTHHMMSS>_<alarm_id>.mp4` filenames written by
+/// `extract_clip` — same local-wall-clock convention as `parse_segment_time`,
+/// just a different suffix after the timestamp (an alarm id instead of
+/// nothing). The timestamp portion itself never contains `_`, so splitting
+/// on the first one is safe.
+fn parse_clip_time(path: &Path) -> Option<NaiveDateTime> {
+    let stem = path.file_stem()?.to_str()?;
+    let ts = stem.split('_').next()?;
+    NaiveDateTime::parse_from_str(ts, SEGMENT_TS_FMT).ok()
+}
+
+async fn sweep_local_clips(clips_dir: &Path, retention_days: u32) -> Result<()> {
+    let mut channels = match tokio::fs::read_dir(clips_dir).await {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+
+    let cutoff = Local::now().naive_local() - chrono::Duration::days(retention_days as i64);
+
+    while let Some(channel_entry) = channels.next_entry().await? {
+        if !channel_entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let mut entries = tokio::fs::read_dir(channel_entry.path()).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("mp4") {
+                continue;
+            }
+            if let Some(ts) = parse_clip_time(&path)
+                && ts < cutoff
+            {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Runs `sweep_local_clips` every 24h for as long as the process runs —
+/// same detached, no-shutdown-signal reasoning as
+/// `gdrive::retention::start_retention_sweep` (no OS resource is held here
+/// either). Independent of whether Google Drive upload is configured: a
+/// clip's local lifetime is no longer tied to its upload outcome (see
+/// `spawn_clip_extraction`), so this sweep is what actually bounds
+/// `clips_dir`'s growth now. `retention_days == 0` disables it (kept
+/// forever), same convention as the Drive-side sweep.
+pub fn start_local_retention_sweep(clips_dir: PathBuf, retention_days: u32) {
+    if retention_days == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            if let Err(e) = sweep_local_clips(&clips_dir, retention_days).await {
+                eprintln!("warning: local clip retention sweep failed: {e}");
+            }
+            tokio::time::sleep(LOCAL_RETENTION_SWEEP_INTERVAL).await;
+        }
+    });
 }
 
 /// Parses `alarm.utc_time` into the account's local wall-clock time — same

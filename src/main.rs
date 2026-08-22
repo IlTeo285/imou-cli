@@ -86,6 +86,12 @@ enum Command {
         /// configured (see `gdrive-login`) — ignored otherwise.
         #[arg(long, default_value_t = 30)]
         gdrive_retention_days: u32,
+        /// How long to keep clips in `--clips-dir` before deleting them (0 =
+        /// keep forever). Independent of `--gdrive-retention-days` — a clip
+        /// uploaded to Drive is no longer deleted locally on upload success,
+        /// so this is what now bounds local disk usage.
+        #[arg(long, default_value_t = 30)]
+        local_retention_days: u32,
     },
     /// Run a foreground service that registers a push callback with Imou
     /// and reacts to motion events as they're delivered — no polling.
@@ -119,6 +125,12 @@ enum Command {
         /// configured (see `gdrive-login`) — ignored otherwise.
         #[arg(long, default_value_t = 30)]
         gdrive_retention_days: u32,
+        /// How long to keep clips in `--clips-dir` before deleting them (0 =
+        /// keep forever). Independent of `--gdrive-retention-days` — a clip
+        /// uploaded to Drive is no longer deleted locally on upload success,
+        /// so this is what now bounds local disk usage.
+        #[arg(long, default_value_t = 30)]
+        local_retention_days: u32,
     },
     /// One-time OAuth setup for Google Drive clip upload (`watch`/`listen`
     /// upload automatically once this has been run — see CLAUDE.md).
@@ -185,6 +197,7 @@ async fn main() -> anyhow::Result<()> {
             pre_roll_secs,
             post_roll_secs,
             gdrive_retention_days,
+            local_retention_days,
         } => {
             watch::run(
                 &client,
@@ -195,6 +208,7 @@ async fn main() -> anyhow::Result<()> {
                 Duration::from_secs(pre_roll_secs),
                 Duration::from_secs(post_roll_secs),
                 gdrive_retention_days,
+                local_retention_days,
             )
             .await?;
         }
@@ -208,6 +222,7 @@ async fn main() -> anyhow::Result<()> {
             post_roll_secs,
             max_push_latency_secs,
             gdrive_retention_days,
+            local_retention_days,
         } => {
             listen::run(
                 &client,
@@ -220,6 +235,7 @@ async fn main() -> anyhow::Result<()> {
                 Duration::from_secs(post_roll_secs),
                 Duration::from_secs(max_push_latency_secs),
                 gdrive_retention_days,
+                local_retention_days,
             )
             .await?;
         }

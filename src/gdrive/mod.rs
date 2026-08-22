@@ -76,10 +76,11 @@ impl GDriveClient {
 
 /// Uploads `local_path` into the Drive folder for `date` (`YYYY-MM-DD`,
 /// created under the configured root if it doesn't exist yet — see
-/// `folders::ensure_day_folder`) and, only on success, deletes the local
-/// file — the local copy is the fallback if the upload fails, so it must
-/// survive any error here untouched.
-pub async fn upload_and_replace(
+/// `folders::ensure_day_folder`). Does not touch the local file either way
+/// — local and Drive copies now have independent retention windows (see
+/// `recorder::start_local_retention_sweep` vs `retention::start_retention_sweep`),
+/// so deleting it here on success would cut the local copy's lifetime short.
+pub async fn upload_clip(
     client: &GDriveClient,
     local_path: &Path,
     channel_name: &str,
@@ -96,6 +97,5 @@ pub async fn upload_and_replace(
 
     upload::upload_file(&client.http, &access_token, Some(&day_folder_id), local_path, &drive_filename).await?;
 
-    tokio::fs::remove_file(local_path).await?;
     Ok(())
 }

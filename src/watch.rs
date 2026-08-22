@@ -101,6 +101,7 @@ pub async fn run(
     pre_roll: Duration,
     post_roll: Duration,
     gdrive_retention_days: u32,
+    local_retention_days: u32,
 ) -> Result<()> {
     let event_log = EventLog::open(events_file)?;
 
@@ -134,6 +135,9 @@ pub async fn run(
     let retention = pre_roll + interval + RETENTION_MARGIN;
 
     let recording = recorder::start_all(&channels, buffer_dir, retention).await?;
+
+    println!("keeping local clips for {local_retention_days}d (0 = forever)");
+    recorder::start_local_retention_sweep(clips_dir.to_path_buf(), local_retention_days);
 
     let gdrive_client = gdrive::config_from_env().map(|cfg| Arc::new(gdrive::GDriveClient::new(cfg)));
     match &gdrive_client {

@@ -32,6 +32,11 @@ services:
       # Only takes effect if GDRIVE_CLIENT_ID/GDRIVE_CLIENT_SECRET are set
       # in .env; ignored otherwise. 0 = keep uploaded clips forever.
       - --gdrive-retention-days=30
+      # Independent of the Drive retention above — a clip uploaded to Drive
+      # is no longer deleted locally on upload success, so this is what
+      # bounds disk usage under ./data/clips (or wherever the volume above
+      # points, e.g. a mounted external disk). 0 = keep forever.
+      - --local-retention-days=30
 
   imou-caddy:
     image: caddy:2
