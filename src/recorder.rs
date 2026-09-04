@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{DateTime, Local, NaiveDateTime, Utc};
 use tokio::io::AsyncWriteExt;
@@ -19,7 +19,45 @@ use crate::mqtt::MqttPublisher;
 
 const SEGMENT_TIME_SECS: u32 = 2;
 const SEGMENT_TS_FMT: &str = "%Y%m%dT%H%M%S";
-const RESTART_BACKOFF: StdDuration = StdDuration::from_secs(5);
+/// Starting (and post-recovery) restart delay. Found live: a NAS/network
+/// blip taking the continuous archive's CIFS share down makes ffmpeg's
+/// `-f segment` mp4 output fail its very first write ("Failed to open
+/// segment ...: Permission denied") within a couple seconds of every
+/// spawn, so a flat delay here — with no escalation — meant the recorder
+/// hammered the dead share with a fresh ffmpeg process every few seconds
+/// for as long as the outage lasted (one observed outage: ~5 hours,
+/// thousands of failed spawns). See `next_restart_backoff` below for the
+/// escalation this now feeds into.
+const RESTART_BACKOFF_BASE: StdDuration = StdDuration::from_secs(5);
+/// Ceiling on the escalating delay — long enough to stop hammering a share
+/// that's down for hours, short enough that recovery is still noticed
+/// within half a minute once the share comes back (still-failing spawns
+/// keep testing recovery at this cadence indefinitely, just less often).
+const RESTART_BACKOFF_MAX: StdDuration = StdDuration::from_secs(60);
+/// A run shorter than this counts as a "fast fail" (still broken) rather
+/// than a real recovery. Set well above ffmpeg's own near-instant failure
+/// on a dead share (observed: exits within ~1-2s), but short enough that a
+/// genuinely healthy recorder — which normally runs for the full
+/// `--continuous-segment-minutes` window, i.e. minutes to hours — always
+/// resets the backoff on its very first successful segment.
+const RESTART_BACKOFF_RESET_THRESHOLD: StdDuration = StdDuration::from_secs(30);
+
+/// Pure. Computes the delay before the *next* restart attempt, given the
+/// delay just used and how long the last ffmpeg run actually stayed alive.
+/// A run that didn't reach `RESTART_BACKOFF_RESET_THRESHOLD` escalates
+/// (doubles, capped at `RESTART_BACKOFF_MAX`) — repeated fast failures are
+/// treated as an ongoing outage (e.g. the continuous archive's NAS share
+/// still being down), not independent one-off events. A run that reached
+/// the threshold resets straight back to `RESTART_BACKOFF_BASE`, so a real
+/// recovery (or a one-off transient failure after a long healthy run)
+/// doesn't linger at a slow retry cadence.
+fn next_restart_backoff(current: StdDuration, last_run_duration: StdDuration) -> StdDuration {
+    if last_run_duration >= RESTART_BACKOFF_RESET_THRESHOLD {
+        RESTART_BACKOFF_BASE
+    } else {
+        std::cmp::min(current.saturating_mul(2), RESTART_BACKOFF_MAX)
+    }
+}
 /// Passed to ffmpeg's RTSP-demuxer-private `-timeout` option (microseconds;
 /// the generic `-rw_timeout` AVOption is *not* honored by the rtsp demuxer
 /// itself — confirmed live, ffmpeg rejects it with "Option not found" when
@@ -500,6 +538,7 @@ async fn run_recorder_supervisor(
     };
 
     let log_path = dir.join("ffmpeg.log");
+    let mut backoff = RESTART_BACKOFF_BASE;
 
     loop {
         if *shutdown_rx.borrow() {
@@ -544,13 +583,16 @@ async fn run_recorder_supervisor(
             Ok(c) => c,
             Err(e) => {
                 eprintln!("warning: failed to spawn ffmpeg recorder for {channel_name}: {e}");
-                tokio::time::sleep(RESTART_BACKOFF).await;
+                backoff = next_restart_backoff(backoff, StdDuration::ZERO);
+                tokio::time::sleep(backoff).await;
                 continue;
             }
         };
+        let spawned_at = Instant::now();
 
         tokio::select! {
             status = child.wait() => {
+                let ran_for = spawned_at.elapsed();
                 match status {
                     Ok(s) if s.success() => {
                         eprintln!("recorder for {channel_name} exited cleanly, restarting");
@@ -565,6 +607,7 @@ async fn run_recorder_supervisor(
                         eprintln!("warning: recorder for {channel_name} wait() failed: {e}");
                     }
                 }
+                backoff = next_restart_backoff(backoff, ran_for);
             }
             _ = shutdown_rx.changed() => {
                 let _ = child.kill().await;
@@ -575,7 +618,7 @@ async fn run_recorder_supervisor(
         if *shutdown_rx.borrow() {
             return;
         }
-        tokio::time::sleep(RESTART_BACKOFF).await;
+        tokio::time::sleep(backoff).await;
     }
 }
 
@@ -831,6 +874,33 @@ pub async fn extract_clip(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_backoff_escalates_on_fast_fail_and_caps() {
+        let mut backoff = RESTART_BACKOFF_BASE;
+        for _ in 0..3 {
+            backoff = next_restart_backoff(backoff, StdDuration::ZERO);
+        }
+        assert_eq!(backoff, StdDuration::from_secs(40));
+        // Keeps doubling but never exceeds the cap, however many more fast
+        // fails follow (the real-world case: an outage lasting hours).
+        for _ in 0..10 {
+            backoff = next_restart_backoff(backoff, StdDuration::ZERO);
+        }
+        assert_eq!(backoff, RESTART_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn restart_backoff_resets_after_run_past_threshold() {
+        let escalated = next_restart_backoff(RESTART_BACKOFF_MAX, StdDuration::from_secs(1));
+        assert_eq!(escalated, RESTART_BACKOFF_MAX);
+
+        let reset = next_restart_backoff(RESTART_BACKOFF_MAX, RESTART_BACKOFF_RESET_THRESHOLD);
+        assert_eq!(reset, RESTART_BACKOFF_BASE);
+
+        let reset_long = next_restart_backoff(RESTART_BACKOFF_MAX, StdDuration::from_secs(3600));
+        assert_eq!(reset_long, RESTART_BACKOFF_BASE);
+    }
 
     // Matches, argument-for-argument, the command verified live to produce
     // two independent, correctly-rotating segment streams from one ffmpeg
