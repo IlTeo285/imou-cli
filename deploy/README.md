@@ -44,11 +44,31 @@ before deploying:
    with real credentials. **Never commit this file** — same rule as the
    repo's own `.env`.
 
-4. Build the image directly on the target host (avoids any
-   cross-compilation/architecture mismatch) — from a copy/clone of this repo:
+4. Build and push the image from your dev machine, not on the target host
+   (see the home-lab registry runbook — building a release binary directly
+   on a small server has stalled it before). Tag with a git short SHA so
+   deploys are reproducible, and also push `:latest`:
    ```sh
-   docker build -t imou-cli:latest .
+   SHA=$(git rev-parse --short HEAD)
+   docker build -t 192.168.2.12:5000/imou-cli:$SHA -t 192.168.2.12:5000/imou-cli:latest .
+   docker login 192.168.2.12:5000 -u registry --password-stdin   # password in 1Password
+   docker push 192.168.2.12:5000/imou-cli:$SHA
+   docker push 192.168.2.12:5000/imou-cli:latest
    ```
+   The target host's Docker daemon must trust this registry as insecure
+   (no TLS, LAN-only) — `/etc/docker/daemon.json` needs
+   `"insecure-registries": ["192.168.2.12:5000"]` (merge it in, don't
+   overwrite the file) followed by `sudo systemctl restart docker`, if not
+   already configured. On the target host, log in and pull before starting
+   the stack:
+   ```sh
+   docker login 192.168.2.12:5000 -u registry --password-stdin
+   docker pull 192.168.2.12:5000/imou-cli:latest
+   ```
+   `docker-compose.yaml`'s `image:` already points at
+   `192.168.2.12:5000/imou-cli:latest` — pin it to a specific `:$SHA` tag
+   instead if you want a deploy that doesn't move when `:latest` is
+   re-pushed later.
 
 5. Start the stack:
    ```sh
@@ -102,6 +122,23 @@ before deploying:
    playable from wherever you mount `./data/continuous` (or the external
    disk) — no extra viewer needed.
 
+9. **Optional — grid continuous recording**: instead of one continuous
+   archive per camera, composes every camera into a single synchronized
+   2x2 grid video — see CLAUDE.md's "Grid continuous recording" section
+   for the full design/rationale. Requires step 8's continuous recording
+   to already be enabled (same volume/flags), plus uncommenting
+   `--continuous-mode=grid` (and, if you want non-default corners, setting
+   `GRID_ORDER=<tl>,<tr>,<bl>,<br>` in `.env` — otherwise corners are
+   assigned alphabetically). This is the one CPU-costly (re-encode) step
+   in this whole deployment — `--grid-tile-size`/`--grid-fps` are the cost
+   knobs, defaulted small (`960x540`/`8fps`) for weak/no-GPU hardware, but
+   **measure actual compose time on your own host before trusting the
+   defaults** (see verification step 9 below) — a host too weak to keep up
+   will fall behind and silently skip windows rather than crash.
+   Per-camera `.mp4`s are transient staging in this mode, not a retained
+   artifact — only `~/imou-cli/data/continuous/grid/seg_...mp4` is durable
+   output.
+
 ## Verification
 
 1. `docker compose ps` (from `~/imou-cli`) — both containers `Up`.
@@ -151,3 +188,22 @@ before deploying:
    CLAUDE.md: it isn't finalized until it rotates), but any earlier one
    should. Confirm `docker logs imou-cli` printed the "recording continuous
    archive to..." startup line.
+9. If grid mode is configured (`--continuous-mode=grid`): `docker logs
+   imou-cli` should show a "compositing continuous archive into a grid
+   at..." startup line, and fail fast at startup (not partway through) if
+   the container's ffmpeg build is missing the `xstack` filter. After
+   **two** `--continuous-segment-minutes` windows have elapsed (the first
+   window has no completed staging segments yet to compose), confirm
+   `~/imou-cli/data/continuous/grid/seg_...mp4` exists, plays, and shows
+   all configured cameras tiled correctly per `GRID_ORDER` — an
+   unconfigured or momentarily-offline camera's corner should render as a
+   plain black tile rather than the whole window failing to appear. Also
+   check `~/imou-cli/data/continuous/.grid-staging/<channel>/` — it should
+   stay small (segments get deleted right after a successful compose, not
+   accumulate); if it's growing unbounded, compose is failing every
+   window, check `docker logs imou-cli` for "grid compose failed" lines.
+   Time how long each window's compose actually takes (roughly, from one
+   "grid segment saved" log line to the next) — it must stay comfortably
+   under `--continuous-segment-minutes` or the composer will keep falling
+   behind and skipping windows; if it doesn't, lower `--grid-tile-size`/
+   `--grid-fps` before relying on this in production.

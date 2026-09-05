@@ -737,6 +737,217 @@ motion-triggered clip extraction — but worth knowing before assuming a
 broken file means the recording pipeline itself is broken: check whether
 a restart happened to land in that segment's window first.
 
+**Non-Imou, continuous-only cameras**: `recorder::LocalCameraConfig` is an
+enum (`Dahua { ip, secure }` — the original template, or `CustomUrl(String)`
+— a full RTSP URL used verbatim, no credentials injected). `local_config_for`
+checks `CAM_<NAME>_URL` before falling back to `CAM_<NAME>_IP`/`_SECURE`, so
+a camera whose RTSP shape/auth doesn't fit the Dahua pattern (e.g. a
+different vendor with no auth at all) can still be recorded. Since such a
+camera has no Imou device/channel, its name can't come from
+`api::devices::list` the way every other channel's does — `watch.rs`/
+`listen.rs` build a *separate* `recording_channels` list (real Imou channels
++ synthetic entries from `recorder::extra_continuous_channels`, which reads
+`EXTRA_CONTINUOUS_CHANNELS`, a comma-separated list of channel names) and
+pass only that to `recorder::start_all`; the original Imou-only `channels`
+list still drives alarm polling (`watch.rs`) and the push device-name map
+(`listen.rs`) unchanged, since a channel-less camera can never produce an
+`Alarm`. Its ring buffer still gets built alongside the continuous archive
+(no continuous-only code path) — simply never consumed, self-cleans via the
+existing retention sweep, negligible cost.
+
+## Grid continuous recording (`--continuous-mode grid`, `src/grid.rs`)
+
+`--continuous-mode grid` (default `separate`, i.e. unchanged behavior)
+replaces per-camera continuous archives with a single video showing every
+configured camera at once, in a fixed 2x2 grid, synchronized on time.
+Still gated by `--continuous-retention-hours > 0` like plain continuous
+recording — `watch.rs`/`listen.rs` warn at startup if `grid` is selected
+with retention left at `0`, since that combination is otherwise a silent
+no-op (easy to miss: the enable/disable knob and the mode knob are two
+different flags).
+
+**Batch post-process, not a live multi-input ffmpeg process** — deliberate
+choice, not a first cut to be replaced later. Each camera keeps writing
+its own continuous `.mp4` segments exactly as in `separate` mode (same
+`-c copy`, same single ffmpeg process/RTSP connection piggybacked on the
+ring buffer — see the "Continuous recording" section above), just into an
+internal, non-user-facing staging tree
+(`<continuous_dir>/.grid-staging/<channel_name>/`) instead of a retained
+per-camera archive. A separate periodic task (`grid::start_grid_composer`,
+spawned once per group from `recorder::start_all`, not per channel — it
+doesn't fit `start_ring_buffer`'s per-channel loop) picks up completed
+staging segments and composes them into one grid segment with
+`ffmpeg -filter_complex xstack` under `<continuous_dir>/grid/`. This is
+the **one** unavoidably CPU-costly re-encode step in this whole codebase —
+everywhere else is stream-copy — which matters because the production
+deployment target is documented above (see the AI vision section) as a
+weak, GPU-less Apollo Lake CPU that already can't run even a small vision
+model. `--grid-tile-size` (default `960x540`) and `--grid-fps` (default
+`8`) are the CPU-cost knobs; `-preset ultrafast -crf 28` is hardcoded, not
+exposed, for v1.
+
+**Sync granularity is per-segment-file, not frame-accurate — and requires
+a producer-side fix to even get that far.** Each camera's continuous-branch
+ffmpeg process starts at an independent wall-clock moment and rotates
+`segment_minutes` after *its own* start, so two cameras' "latest segment"
+are not otherwise aligned to the same window at all. The fix is
+`-segment_atclocktime 1` added to the continuous branch only (not the
+`.ts` ring-buffer branch) in `build_recorder_args` — this makes the
+`segment` muxer cut at wall-clock multiples of `segment_time`
+(`:00/:15/:30/:45` for 15-minute segments) regardless of when a camera's
+ffmpeg process actually started or last auto-restarted, leaving only a few
+seconds of keyframe-boundary jitter between cameras rather than up to a
+full `segment_minutes` of drift.
+
+**Verified live** (synthetic real-time-paced sources, `-re`, same
+methodology as the original two-branch continuous-recording discovery
+above — no real cameras needed for this part, since it's a property of
+the `segment` muxer itself, not of the video content): two independent
+ffmpeg processes, each with the same two-branch shape `build_recorder_args`
+produces (a plain `.ts` ring-buffer branch plus a `.mp4` continuous branch
+with `-segment_atclocktime 1`), started 4 seconds apart against a
+`testsrc` lavfi source. The `.ts` branch (no `atclocktime`) rotated on its
+own process-relative schedule as before, unaffected. The `.mp4` branch on
+*both* processes converged onto the exact same absolute wall-clock
+boundaries once past each process's own irregular first (partial) segment
+— e.g. one process's segments landed at `:40` (partial), `:42`, `:48`,
+`:54`, `:00`, `:06` and the other's (started at `:44`) landed at `:44`
+(partial), `:48`, `:54`, `:00`, `:06`, `:12` — `:48/:54/:00/:06` identical
+across both despite the different start times. This confirms the flag is
+correctly honored on the *second* muxer branch of a two-output
+single-process invocation, not just the well-trodden single-output case.
+
+**Matching algorithm** (`grid::next_window`/`bucket_window`/
+`is_completed`/`match_window`, all pure and unit-tested): a single shared
+cursor advances the whole group through wall-clock windows (not one cursor
+per camera — the point is one composed output per window). Per window,
+per configured slot: list that camera's staging segments, keep only ones
+provably `is_completed` (a newer sibling exists, proving ffmpeg rotated
+past it, **or** enough wall-clock time has elapsed since its nominal start
+that it must have rotated regardless — the latter guards a camera that
+dies right after writing its last segment, which would otherwise never
+satisfy the first condition and strand that segment forever), then pick
+whichever completed segment's start time is closest to the window within a
+tolerance (`grid::alignment_tolerance`, **not** `recorder::FLUSH_MARGIN` —
+see the live-verification note below for why those two needed to be
+different constants). A slot with no match in range becomes `None` —
+composed as a black tile via an `-f lavfi -i
+color=c=black:...` source, **not** a reason to fail the whole window; only
+when *all four* slots come back `None` does that window get skipped
+entirely (logged once, cursor still advances — a permanently-down camera
+set must not wedge the composer or spam all-black files forever). If the
+composer falls behind by more than one window, `next_window` jumps
+straight to the newest fully-elapsed boundary rather than replaying every
+missed one.
+
+**`xstack`, not pairwise `hstack`+`vstack`**: tiles are pre-scaled to
+identical size first, making the fixed 4-slot
+`layout=0_0|w0_0|0_h0|w0_h0` trivial, and `xstack=...:shortest=1` handles
+"the real inputs present this window have slightly different durations"
+for the whole grid in one place — the composed segment's length is simply
+`min` of the real inputs, with no separate placeholder-duration
+computation needed (an infinite `lavfi` black source needs no `-t`/`d=`
+at all). Requires ffmpeg 4.1+ (`xstack` filter). **Verified live**: the
+actual deploy image's ffmpeg (Debian bookworm's apt package, 5.1.9-0
++deb12u1 — the same one `Dockerfile` installs) has both `xstack` and
+`libx264`; `recorder::start_all` also calls `grid::check_xstack_available`
+before spawning the composer, so a future ffmpeg swap missing the filter
+fails loudly at startup instead of per-window inside the detached
+composer task. The exact `build_grid_args` command shape was run
+end-to-end against two real segment files (from the synthetic test above)
+plus two black placeholders: output correctly came back as 1920x1080
+(`2 * 960x540`), duration `6.000000s` matching `shortest=1`'s contract
+(the shortest real input present), and a frame pulled from the middle of
+it visually confirmed the TL/TR/BL/BR layout — the two real sources in the
+top corners, both bottom corners solid black, no cross-contamination
+between slots.
+
+**Camera order** (`grid::resolve_grid_order`, TL/TR/BL/BR): `--grid-order`
+flag, else `GRID_ORDER` env var, else an alphabetically-sorted default —
+deliberately never a direct `HashSet<String>` iteration (`recorded_channels`
+has no stable order across runs). A configured name with no local RTSP
+config becomes a permanent black tile (warned once, not an error) — same
+fail-open convention as `local_config_for` returning `None` elsewhere.
+More than 4 names is a hard startup error (ambiguous), not a silent
+truncation.
+
+**Staging retention is deliberately NOT the user's `--continuous-retention-hours`
+window.** In `grid` mode, `start_ring_buffer` skips spawning its normal
+per-channel continuous-cleanup task entirely (which would otherwise sweep
+staging with the same — potentially large, e.g. 48h — retention meant for
+a *final* artifact, letting unconsumed raw per-camera footage pile up per
+camera and defeating "replace, don't retain per-camera"). Instead,
+`grid::staging_ttl` (`segment_minutes * 3` — roughly two windows of slack
+past the composer's own cadence) bounds staging independently, swept once
+for the whole `.grid-staging` tree by the composer task itself. This also
+doubles as cleanup for a camera later removed from `--grid-order`/config —
+its old staging subdirectory has no other path to ever being reaped.
+
+**Fail-open on a failed compose, same posture as everywhere else in this
+pipeline** (gdrive upload, AI gating, snapshot extraction): if the `ffmpeg
+xstack` call itself fails for one window, the staging inputs for that
+window are deliberately **not** deleted (left for the TTL sweep to reap
+later, in case someone wants to hand-compose that window manually) and the
+cursor still advances past it — retrying the same window forever is
+explicitly rejected, since a stuck window would wedge the composer the
+same way a restart-corrupted continuous segment is already documented
+(above) to be unrecoverable, not retried.
+
+**Real-camera finding that broke the first cut of the matching tolerance —
+worth remembering**: the synthetic-source test above proved
+`-segment_atclocktime` alignment *works*, but running the actual composer
+against 4 real cameras (2 Imou/Dahua, 2 plain `CAM_<NAME>_URL` ones) showed
+every window coming back "no available camera footage from any configured
+slot" past the initial warm-up, even with all 4 RTSP connections alive and
+producing segments. Root cause: `-segment_atclocktime`'s cut point is
+bounded by *keyframe availability*, not wall-clock precision — it cuts at
+the first keyframe at-or-after the boundary, and real consumer cameras'
+keyframe interval is far sparser than the synthetic `testsrc` encoder's.
+Observed live, with `segment_time=60` for a fast test cycle: real cut
+points landing up to ~29s past the nominal minute boundary, consistently,
+not just as occasional jitter. `recorder::FLUSH_MARGIN` (5s) — calibrated
+against the synthetic, frequent-keyframe source — was nowhere near
+generous enough once real keyframe-driven drift entered the picture; used
+as `match_window`'s tolerance, it rejected every real segment as "too far
+from the boundary" to match. Fixed with a dedicated `grid::alignment_tolerance`
+(60s, capped at half the segment length so a short test `segment_minutes`
+doesn't get an oversized tolerance relative to its own window) used for
+`match_window`'s tolerance, `is_completed`'s "enough time elapsed" branch,
+and the composer's own per-window readiness wait — `recorder::FLUSH_MARGIN`
+itself is untouched and still governs the ring-buffer/clip-extraction
+flush timing it was originally sized for elsewhere in this codebase; grid
+matching needed a materially larger, separately-named constant, not a
+reused one. **Re-verified live after the fix**, same 4 real cameras, 3
+consecutive windows: every one found real footage on all 4 slots (only the
+very first 1-2 windows during startup warm-up still legitimately have
+nothing yet, which is correct, not a bug).
+
+**Compose command verified live end-to-end against real camera footage**,
+not just synthetic sources: took 4 real staging segments (one per camera,
+same matched window) produced by the run above, ran the exact
+`build_grid_args` shape through the actual deploy image's ffmpeg (Debian
+bookworm, `libx264`) — output came back as a correctly-dimensioned,
+correctly-durationed (`shortest=1` honored against real, slightly
+differing real segment lengths), playable grid video; a frame pulled from
+the middle of it confirmed by eye all 4 real camera feeds tiled into the
+correct TL/TR/BL/BR corners with no cross-contamination between slots (per
+this project's "describe the mechanism and result in the abstract, not the
+specific real-world content" privacy rule — see the top of this file — the
+verification frame itself was not kept).
+
+**Genuinely still not verified, because it requires the specific
+production host**: real compose throughput on the actual Apollo Lake
+production target at the default tile size/fps — the real go/no-go for
+whether `960x540`/`8fps`/`ultrafast`/`crf 28` are sufficient there, or
+whether a VAAPI (`h264_vaapi`) escape hatch becomes necessary sooner than
+"eventually" (that hardware does have QuickSync, per the AI vision section
+above, but building that escape hatch before measuring the plain-CPU path
+first is out of scope for this feature). Whether the real RTSP source
+carries an audio track was also not directly checked, but doesn't matter
+either way — the compose filtergraph maps only `[N:v]` per input and the
+output uses `-an`, sidestepping the question by design. Check both during
+the deploy verification steps in `deploy/README.md`.
+
 ## Filename timezone (`--filename-timezone`, `src/recorder.rs`)
 
 **Real bug found live, root cause was container configuration, not

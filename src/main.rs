@@ -4,6 +4,7 @@ mod config;
 mod error;
 mod event_log;
 mod gdrive;
+mod grid;
 mod listen;
 mod motion_event;
 mod mqtt;
@@ -21,7 +22,18 @@ use clap::{Parser, Subcommand};
 use api::ptz::Direction;
 use client::ImouClient;
 use config::Config;
-use recorder::FilenameTimezone;
+use recorder::{ContinuousMode, FilenameTimezone};
+
+/// Parses `--grid-tile-size`'s `WxH` shape (e.g. `960x540`) into a
+/// `(width, height)` pair.
+fn parse_tile_size(s: &str) -> Result<(u32, u32), String> {
+    let (w, h) = s
+        .split_once('x')
+        .ok_or_else(|| format!("expected WxH (e.g. 960x540), got '{s}'"))?;
+    let w = w.parse::<u32>().map_err(|e| format!("invalid width '{w}': {e}"))?;
+    let h = h.parse::<u32>().map_err(|e| format!("invalid height '{h}': {e}"))?;
+    Ok((w, h))
+}
 
 #[derive(Parser)]
 #[command(name = "imou", about = "CLI for the Imou Open Platform")]
@@ -107,6 +119,35 @@ enum Command {
         /// not just an always-on sweep. Set e.g. 48 for "last 2 days".
         #[arg(long, default_value_t = 0)]
         continuous_retention_hours: u32,
+        /// `separate` (default) keeps today's behavior: one independent
+        /// continuous archive per camera. `grid` instead composes every
+        /// camera's footage into a single synchronized 2x2 grid video (see
+        /// CLAUDE.md's "Grid continuous recording" section) — the
+        /// per-camera `.mp4`s become transient raw material, not a
+        /// retained artifact. Still gated by `--continuous-retention-hours
+        /// > 0`.
+        #[arg(long, value_enum, default_value_t = ContinuousMode::Separate)]
+        continuous_mode: ContinuousMode,
+        /// Only relevant in `grid` mode: which camera occupies which grid
+        /// corner, as `top-left,top-right,bottom-left,bottom-right`
+        /// (comma-separated channel names). Falls back to the `GRID_ORDER`
+        /// env var, then to an alphabetically-sorted default. Fewer than 4
+        /// names leaves the remaining corners permanently black; a name
+        /// with no local RTSP config also renders as a permanent black
+        /// tile (warned at startup, not an error).
+        #[arg(long)]
+        grid_order: Option<String>,
+        /// Only relevant in `grid` mode: per-tile size (`WxH`) of the
+        /// composed grid's output — the one unavoidably CPU-costly
+        /// re-encode step in this CLI (everything else is stream-copy), so
+        /// kept small by default for weak/no-GPU hardware.
+        #[arg(long, default_value = "960x540", value_parser = parse_tile_size)]
+        grid_tile_size: (u32, u32),
+        /// Only relevant in `grid` mode: frame rate of the composed grid's
+        /// output — the largest single lever for compose CPU cost without
+        /// a GPU re-encode.
+        #[arg(long, default_value_t = 8)]
+        grid_fps: u32,
         #[arg(long, default_value_t = 30)]
         pre_roll_secs: u64,
         #[arg(long, default_value_t = 60)]
@@ -196,6 +237,35 @@ enum Command {
         /// not just an always-on sweep. Set e.g. 48 for "last 2 days".
         #[arg(long, default_value_t = 0)]
         continuous_retention_hours: u32,
+        /// `separate` (default) keeps today's behavior: one independent
+        /// continuous archive per camera. `grid` instead composes every
+        /// camera's footage into a single synchronized 2x2 grid video (see
+        /// CLAUDE.md's "Grid continuous recording" section) — the
+        /// per-camera `.mp4`s become transient raw material, not a
+        /// retained artifact. Still gated by `--continuous-retention-hours
+        /// > 0`.
+        #[arg(long, value_enum, default_value_t = ContinuousMode::Separate)]
+        continuous_mode: ContinuousMode,
+        /// Only relevant in `grid` mode: which camera occupies which grid
+        /// corner, as `top-left,top-right,bottom-left,bottom-right`
+        /// (comma-separated channel names). Falls back to the `GRID_ORDER`
+        /// env var, then to an alphabetically-sorted default. Fewer than 4
+        /// names leaves the remaining corners permanently black; a name
+        /// with no local RTSP config also renders as a permanent black
+        /// tile (warned at startup, not an error).
+        #[arg(long)]
+        grid_order: Option<String>,
+        /// Only relevant in `grid` mode: per-tile size (`WxH`) of the
+        /// composed grid's output — the one unavoidably CPU-costly
+        /// re-encode step in this CLI (everything else is stream-copy), so
+        /// kept small by default for weak/no-GPU hardware.
+        #[arg(long, default_value = "960x540", value_parser = parse_tile_size)]
+        grid_tile_size: (u32, u32),
+        /// Only relevant in `grid` mode: frame rate of the composed grid's
+        /// output — the largest single lever for compose CPU cost without
+        /// a GPU re-encode.
+        #[arg(long, default_value_t = 8)]
+        grid_fps: u32,
         #[arg(long, default_value_t = 30)]
         pre_roll_secs: u64,
         #[arg(long, default_value_t = 60)]
@@ -308,6 +378,10 @@ async fn main() -> anyhow::Result<()> {
             continuous_dir,
             continuous_segment_minutes,
             continuous_retention_hours,
+            continuous_mode,
+            grid_order,
+            grid_tile_size,
+            grid_fps,
             pre_roll_secs,
             post_roll_secs,
             gdrive_retention_days,
@@ -327,6 +401,10 @@ async fn main() -> anyhow::Result<()> {
                 &continuous_dir,
                 continuous_segment_minutes,
                 continuous_retention_hours,
+                continuous_mode,
+                grid_order,
+                grid_tile_size,
+                grid_fps,
                 Duration::from_secs(pre_roll_secs),
                 Duration::from_secs(post_roll_secs),
                 gdrive_retention_days,
@@ -348,6 +426,10 @@ async fn main() -> anyhow::Result<()> {
             continuous_dir,
             continuous_segment_minutes,
             continuous_retention_hours,
+            continuous_mode,
+            grid_order,
+            grid_tile_size,
+            grid_fps,
             pre_roll_secs,
             post_roll_secs,
             max_push_latency_secs,
@@ -369,6 +451,10 @@ async fn main() -> anyhow::Result<()> {
                 &continuous_dir,
                 continuous_segment_minutes,
                 continuous_retention_hours,
+                continuous_mode,
+                grid_order,
+                grid_tile_size,
+                grid_fps,
                 Duration::from_secs(pre_roll_secs),
                 Duration::from_secs(post_roll_secs),
                 Duration::from_secs(max_push_latency_secs),

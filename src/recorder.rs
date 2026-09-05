@@ -72,33 +72,67 @@ const CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(5);
 const LOCAL_RETENTION_SWEEP_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 /// Extra time to wait past a segment's nominal start before trusting it
 /// covers that instant, and past a clip window's end before assuming
-/// ffmpeg has flushed the segment that covers it to disk.
-const FLUSH_MARGIN: chrono::Duration = chrono::Duration::seconds(5);
+/// ffmpeg has flushed the segment that covers it to disk. Also reused by
+/// `grid` as its cross-camera matching tolerance — see that module.
+pub(crate) const FLUSH_MARGIN: chrono::Duration = chrono::Duration::seconds(5);
 
-pub struct LocalCameraConfig {
-    pub ip: String,
-    pub secure: String,
+pub enum LocalCameraConfig {
+    /// Dahua/Imou family: URL built from IP + password, Digest auth,
+    /// username hardcoded `admin` — see `rtsp_url`.
+    Dahua { ip: String, secure: String },
+    /// Any other camera: the full RTSP URL is supplied as-is, no
+    /// credentials injected — for cameras whose auth/path doesn't fit the
+    /// Dahua template (e.g. a channel-less, non-Imou camera).
+    CustomUrl(String),
 }
 
-/// Reads `CAM_{NAME}_IP` / `CAM_{NAME}_SECURE` from the environment, where
-/// `{NAME}` is `channel_name` upper-cased (e.g. "ingresso" -> CAM_INGRESSO_IP).
-/// Returns `None` if either is missing — that channel simply isn't recorded
-/// locally, motion logging continues as normal.
+/// Reads `CAM_{NAME}_URL` (a full custom RTSP URL, used verbatim) or, if
+/// that's absent, `CAM_{NAME}_IP` / `CAM_{NAME}_SECURE` (the Dahua/Imou
+/// template) from the environment, where `{NAME}` is `channel_name`
+/// upper-cased (e.g. "ingresso" -> CAM_INGRESSO_IP). Returns `None` if
+/// neither is configured — that channel simply isn't recorded locally,
+/// motion logging continues as normal.
 pub fn local_config_for(channel_name: &str) -> Option<LocalCameraConfig> {
     let key = channel_name.to_uppercase();
+    if let Ok(url) = std::env::var(format!("CAM_{key}_URL")) {
+        return Some(LocalCameraConfig::CustomUrl(url));
+    }
     let ip = std::env::var(format!("CAM_{key}_IP")).ok()?;
     let secure = std::env::var(format!("CAM_{key}_SECURE")).ok()?;
-    Some(LocalCameraConfig { ip, secure })
+    Some(LocalCameraConfig::Dahua { ip, secure })
 }
 
 /// Main HD stream (`subtype=0`) over local RTSP — verified live against a
 /// real camera (Digest auth, username always `admin` for this Dahua/Imou
-/// family). This never touches the Imou cloud.
+/// family). This never touches the Imou cloud. `CustomUrl` is passed
+/// through unchanged (no credentials injected) for cameras that don't fit
+/// that template.
 fn rtsp_url(cfg: &LocalCameraConfig) -> String {
-    format!(
-        "rtsp://admin:{}@{}:554/cam/realmonitor?channel=1&subtype=0",
-        cfg.secure, cfg.ip
-    )
+    match cfg {
+        LocalCameraConfig::Dahua { ip, secure } => {
+            format!("rtsp://admin:{secure}@{ip}:554/cam/realmonitor?channel=1&subtype=0")
+        }
+        LocalCameraConfig::CustomUrl(url) => url.clone(),
+    }
+}
+
+/// Synthetic `(device_id, channel_id, channel_name)` entries for cameras
+/// with no Imou device/channel behind them at all (e.g. a plain LAN RTSP
+/// camera unrelated to the Imou account) — read from
+/// `EXTRA_CONTINUOUS_CHANNELS` (comma-separated channel names, each
+/// expected to have its own `CAM_<NAME>_URL` set). Meant to be appended
+/// *only* to the channel list passed to `start_all` for continuous
+/// recording — never to the alarm-polling list in `watch.rs` or the push
+/// device-name map in `listen.rs`, since these channels can never produce
+/// an `Alarm`. `device_id`/`channel_id` are inert placeholders — `start_all`
+/// only uses them to route to this same tuple's channel name.
+pub fn extra_continuous_channels() -> Vec<(String, String, String)> {
+    std::env::var("EXTRA_CONTINUOUS_CHANNELS")
+        .ok()
+        .into_iter()
+        .flat_map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect::<Vec<_>>())
+        .map(|name| (format!("local-{name}"), "0".to_string(), name))
+        .collect()
 }
 
 pub async fn check_ffmpeg_available() -> Result<()> {
@@ -124,6 +158,19 @@ fn channel_continuous_dir(continuous_dir: &Path, channel_name: &str) -> PathBuf 
     continuous_dir.join(channel_name)
 }
 
+/// Whether each camera's continuous archive is kept as its own separate
+/// file tree (today's original behavior) or fed into `grid`'s periodic
+/// compositor to produce one synchronized multi-camera video instead — see
+/// CLAUDE.md's "Grid continuous recording" section. In `Grid` mode, the
+/// per-camera `.mp4`s this module still writes are transient raw material
+/// (an internal `.grid-staging` tree), not a retained artifact — only the
+/// composed grid video is durable output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ContinuousMode {
+    Separate,
+    Grid,
+}
+
 /// Config for the optional continuous (non-motion-triggered) recording
 /// archive — see CLAUDE.md's "Continuous recording" section. `None`
 /// anywhere in this module means the feature is off, same "no-op if
@@ -138,6 +185,16 @@ pub struct ContinuousConfig {
     pub dir: PathBuf,
     pub segment_minutes: u32,
     pub retention_hours: u32,
+    pub mode: ContinuousMode,
+    /// Raw `--grid-order` value (comma-separated channel names, TL,TR,BL,BR),
+    /// resolved by `grid::resolve_grid_order` — only consulted in `Grid`
+    /// mode. `None` falls through to the `GRID_ORDER` env var, then to an
+    /// alphabetically-sorted default.
+    pub grid_order: Option<String>,
+    /// Only consulted in `Grid` mode.
+    pub grid_tile_size: (u32, u32),
+    /// Only consulted in `Grid` mode.
+    pub grid_fps: u32,
 }
 
 /// Which wall-clock convention to use for every filename this module
@@ -222,6 +279,33 @@ pub async fn start_all(
                 cont.segment_minutes,
                 cont.retention_hours
             );
+            if cont.mode == ContinuousMode::Grid {
+                crate::grid::validate_tile_size(cont.grid_tile_size.0, cont.grid_tile_size.1)?;
+                crate::grid::check_xstack_available().await?;
+                let env_order = std::env::var("GRID_ORDER").ok();
+                let order =
+                    crate::grid::resolve_grid_order(cont.grid_order.as_deref(), env_order.as_deref(), &recorded_channels)?;
+                let grid_config = crate::grid::GridConfig {
+                    tile_size: cont.grid_tile_size,
+                    fps: cont.grid_fps,
+                    order,
+                };
+                println!(
+                    "compositing continuous archive into a grid at {} (tile {}x{}, {}fps)",
+                    cont.dir.join("grid").display(),
+                    cont.grid_tile_size.0,
+                    cont.grid_tile_size.1,
+                    cont.grid_fps
+                );
+                handles.push(crate::grid::start_grid_composer(
+                    cont.dir.join(".grid-staging"),
+                    cont.dir.join("grid"),
+                    cont.segment_minutes,
+                    grid_config,
+                    filename_tz,
+                    shutdown_rx.clone(),
+                ));
+            }
         }
     }
 
@@ -426,7 +510,16 @@ pub fn start_ring_buffer(
 
     let mut tasks = vec![recorder_task, cleanup_task];
 
-    if let Some(cont) = continuous {
+    // In `Grid` mode, this channel's continuous branch writes into the
+    // internal `.grid-staging` tree instead of a retained per-channel
+    // archive (see `continuous_write_dir`) — that tree is swept once for
+    // the whole group by `grid::start_grid_composer`'s own TTL sweep, not
+    // per-channel here with the user's (potentially much larger)
+    // `retention_hours`, which would otherwise let unconsumed raw footage
+    // accumulate per camera and defeat "replace, don't retain per-camera."
+    if let Some(cont) = continuous
+        && cont.mode == ContinuousMode::Separate
+    {
         let cont_dir = channel_continuous_dir(&cont.dir, &channel_name);
         let cont_retention = StdDuration::from_secs(cont.retention_hours as u64 * 3600);
         let mut shutdown_rx = shutdown_rx.clone();
@@ -447,6 +540,18 @@ pub fn start_ring_buffer(
     }
 
     tasks
+}
+
+/// Where a channel's continuous-archive branch actually writes: the normal
+/// `<dir>/<channel_name>` in `Separate` mode, or an internal,
+/// non-user-facing `<dir>/.grid-staging/<channel_name>` in `Grid` mode —
+/// raw material for `grid::start_grid_composer`, not a retained artifact
+/// itself.
+fn continuous_write_dir(cont: &ContinuousConfig, channel_name: &str) -> PathBuf {
+    match cont.mode {
+        ContinuousMode::Separate => channel_continuous_dir(&cont.dir, channel_name),
+        ContinuousMode::Grid => channel_continuous_dir(&cont.dir.join(".grid-staging"), channel_name),
+    }
 }
 
 /// Builds the ffmpeg argument vector for one recorder invocation: always the
@@ -527,7 +632,7 @@ async fn run_recorder_supervisor(
 
     let continuous_dir = match &continuous {
         Some(cont) => {
-            let d = channel_continuous_dir(&cont.dir, &channel_name);
+            let d = continuous_write_dir(cont, &channel_name);
             if let Err(e) = tokio::fs::create_dir_all(&d).await {
                 eprintln!("error: cannot create continuous archive dir for {channel_name}: {e}");
                 return;
@@ -625,8 +730,10 @@ async fn run_recorder_supervisor(
 /// Parses `seg_YYYYMMDDTHHMMSS.ts` filenames as naive local wall-clock
 /// timestamps (matching ffmpeg's `-strftime 1`, which formats using the
 /// process's local time — same convention `watch.rs` already uses for
-/// `getAlarmMessage` windows, for the same underlying reason).
-fn parse_segment_time(path: &Path) -> Option<NaiveDateTime> {
+/// `getAlarmMessage` windows, for the same underlying reason). Extension-
+/// agnostic (only reads the `seg_` prefix), so `grid` reuses this verbatim
+/// for staging `.mp4` segments too.
+pub(crate) fn parse_segment_time(path: &Path) -> Option<NaiveDateTime> {
     let stem = path.file_stem()?.to_str()?;
     let ts = stem.strip_prefix("seg_")?;
     NaiveDateTime::parse_from_str(ts, SEGMENT_TS_FMT).ok()
@@ -635,8 +742,9 @@ fn parse_segment_time(path: &Path) -> Option<NaiveDateTime> {
 /// Used for both the short-lived ring buffer (`extension = "ts"`) and the
 /// continuous archive (`extension = "mp4"`) — same `seg_<timestamp>.<ext>`
 /// naming, same `parse_segment_time`, just different directories,
-/// extensions, and retention windows.
-async fn cleanup_old_segments(dir: &Path, extension: &str, retention: StdDuration, tz: FilenameTimezone) -> Result<()> {
+/// extensions, and retention windows. Also reused by `grid`'s staging TTL
+/// sweep, one call per per-camera staging subdirectory.
+pub(crate) async fn cleanup_old_segments(dir: &Path, extension: &str, retention: StdDuration, tz: FilenameTimezone) -> Result<()> {
     let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -769,8 +877,9 @@ fn alarm_filename_time(alarm: &Alarm, tz: FilenameTimezone) -> Result<NaiveDateT
 /// "Now," naive, in whichever convention `tz` selects — must match
 /// whatever convention was used to write the filenames being compared
 /// against (retention sweep cutoffs, or `extract_clip`'s "has the window
-/// landed on disk yet" check).
-fn now_naive(tz: FilenameTimezone) -> NaiveDateTime {
+/// landed on disk yet" check). Also used by `grid`'s composer tick loop,
+/// for the same reason.
+pub(crate) fn now_naive(tz: FilenameTimezone) -> NaiveDateTime {
     match tz {
         FilenameTimezone::Utc => Utc::now().naive_utc(),
         FilenameTimezone::Local => Local::now().naive_local(),
@@ -966,6 +1075,39 @@ mod tests {
                 "/continuous/ingresso/seg_%Y%m%dT%H%M%S.mp4",
             ]
         );
+    }
+
+    #[test]
+    fn rtsp_url_passes_custom_url_through_unchanged() {
+        let cfg = LocalCameraConfig::CustomUrl("rtsp://192.168.1.102/ch0_0.h264".to_string());
+        assert_eq!(rtsp_url(&cfg), "rtsp://192.168.1.102/ch0_0.h264");
+    }
+
+    #[test]
+    fn rtsp_url_builds_dahua_template() {
+        let cfg = LocalCameraConfig::Dahua { ip: "10.0.0.5".to_string(), secure: "pw".to_string() };
+        assert_eq!(rtsp_url(&cfg), "rtsp://admin:pw@10.0.0.5:554/cam/realmonitor?channel=1&subtype=0");
+    }
+
+    #[test]
+    fn extra_continuous_channels_parses_comma_list_into_placeholder_tuples() {
+        // SAFETY: single-threaded test, no other test reads this var.
+        unsafe { std::env::set_var("EXTRA_CONTINUOUS_CHANNELS", " backyard , shed ,,") };
+        let channels = extra_continuous_channels();
+        unsafe { std::env::remove_var("EXTRA_CONTINUOUS_CHANNELS") };
+        assert_eq!(
+            channels,
+            vec![
+                ("local-backyard".to_string(), "0".to_string(), "backyard".to_string()),
+                ("local-shed".to_string(), "0".to_string(), "shed".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn extra_continuous_channels_empty_when_unset() {
+        unsafe { std::env::remove_var("EXTRA_CONTINUOUS_CHANNELS") };
+        assert!(extra_continuous_channels().is_empty());
     }
 
     #[test]

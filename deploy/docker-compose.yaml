@@ -5,7 +5,12 @@
 
 services:
   imou-cli:
-    image: imou-cli:latest
+    # Pulled from the private LAN registry on fedora-node (192.168.2.12:5000)
+    # instead of built on this host — see deploy/README.md's "Build and
+    # push" step. Bump this tag (a git short SHA, e.g. 4bcd7d1) on every
+    # release; ":latest" is also pushed but pinning to a SHA here makes
+    # `docker compose pull` deterministic about what actually gets deployed.
+    image: 192.168.2.12:5000/imou-cli:latest
     container_name: imou-cli
     restart: unless-stopped
     networks:
@@ -57,6 +62,16 @@ services:
       # CLAUDE.md's "Continuous recording" section.
       # - --continuous-dir=/app/continuous
       # - --continuous-retention-hours=48
+      # Further opt-in on top of the above: instead of one archive per
+      # camera, compose all cameras into a single synchronized 2x2 grid
+      # video (see CLAUDE.md's "Grid continuous recording" section) — the
+      # per-camera .mp4s become transient staging, only the grid video is
+      # kept. This is the one CPU-costly (re-encode) step in this whole
+      # deployment; --grid-tile-size/--grid-fps below are the cost knobs.
+      # Camera corner order comes from GRID_ORDER in .env.
+      # - --continuous-mode=grid
+      # - --grid-tile-size=960x540
+      # - --grid-fps=8
       # Only takes effect if GDRIVE_CLIENT_ID/GDRIVE_CLIENT_SECRET are set
       # in .env; ignored otherwise. 0 = keep uploaded clips forever.
       - --gdrive-retention-days=30

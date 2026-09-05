@@ -200,6 +200,10 @@ pub async fn run(
     continuous_dir: &Path,
     continuous_segment_minutes: u32,
     continuous_retention_hours: u32,
+    continuous_mode: recorder::ContinuousMode,
+    grid_order: Option<String>,
+    grid_tile_size: (u32, u32),
+    grid_fps: u32,
     pre_roll: Duration,
     post_roll: Duration,
     max_push_latency: Duration,
@@ -232,13 +236,27 @@ pub async fn run(
     // (default generous: a cold registration was observed live to take
     // ~48 minutes before its first real delivery).
     let retention = pre_roll + max_push_latency + RETENTION_MARGIN;
+    if continuous_mode == recorder::ContinuousMode::Grid && continuous_retention_hours == 0 {
+        eprintln!(
+            "warning: --continuous-mode grid has no effect while --continuous-retention-hours is 0 \
+             (that flag is still the overall feature-enable gate) — set a retention value to actually \
+             enable grid recording"
+        );
+    }
     let continuous_config = (continuous_retention_hours > 0).then(|| recorder::ContinuousConfig {
         dir: continuous_dir.to_path_buf(),
         segment_minutes: continuous_segment_minutes,
         retention_hours: continuous_retention_hours,
+        mode: continuous_mode,
+        grid_order,
+        grid_tile_size,
+        grid_fps,
     });
 
-    let recording = recorder::start_all(&channels, buffer_dir, retention, continuous_config, filename_tz).await?;
+    let mut recording_channels = channels.clone();
+    recording_channels.extend(recorder::extra_continuous_channels());
+    let recording =
+        recorder::start_all(&recording_channels, buffer_dir, retention, continuous_config, filename_tz).await?;
 
     println!("keeping local clips for {local_retention_days}d (0 = forever)");
     recorder::start_local_retention_sweep(clips_dir.to_path_buf(), "mp4", local_retention_days, filename_tz);
